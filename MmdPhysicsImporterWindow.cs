@@ -50,6 +50,21 @@ namespace Mmd2GltfImporter
         private List<GltfTextureData2> gltfTexturesCache;
         private int binChunkStart = -1;
         private Dictionary<int, Texture2D> extractedTextureCache = new Dictionary<int, Texture2D>();
+        private Dictionary<int, Texture2D> sharedToonCache = new Dictionary<int, Texture2D>();
+
+        // ★調整パネル用の数値（すべて、これまで直接コードに埋め込んでいたマジックナンバー）。
+        //   髪の震え・スカートの厚み・関節の遊び・輪郭線の太さなど、モデルごとに
+        //   最適値が変わる部分をパネルからその場で調整できるようにする。
+        private bool showTuningPanel = true;
+        private float tune_massMin = 0.01f;              // 剛体の最小質量
+        private float tune_linearDampingMin = 0.05f;     // 剛体の最小Linear Damping
+        private float tune_angularDampingMin = 0.2f;     // 剛体の最小Angular Damping（髪の震え対策）
+        private float tune_springRotFloor = 3f;          // 関節ばねの最低値
+        private float tune_skirtColliderScale = 0.6f;    // スカートのコライダー縮小率
+        private float tune_hairColliderScale = 0.85f;    // 髪のコライダー縮小率
+        private float tune_maxDepenetrationVelocity = 1f; // めり込み解消速度の上限（衝突再有効化時の弾け防止）
+        private float tune_angularSlackDeg = 45f;        // 関節角度制限の遊び（度）
+        private float tune_outlineWidthFactor = 0.08f;   // edgeSize→lilToon _OutlineWidthへの換算係数
 
         private void OnGUI()
         {
@@ -58,6 +73,44 @@ namespace Mmd2GltfImporter
 
             targetPrefab = (GameObject)EditorGUILayout.ObjectField(
                 "対象モデル (Scene上)", targetPrefab, typeof(GameObject), true);
+
+            EditorGUILayout.Space();
+
+            showTuningPanel = EditorGUILayout.Foldout(showTuningPanel, "調整パネル（髪・スカート・関節・輪郭線）", true);
+            if (showTuningPanel)
+            {
+                EditorGUI.indentLevel++;
+                GUILayout.Label("剛体の基本設定", EditorStyles.miniBoldLabel);
+                tune_massMin = EditorGUILayout.Slider("最小質量", tune_massMin, 0.001f, 1f);
+                tune_linearDampingMin = EditorGUILayout.Slider("最小Linear Damping", tune_linearDampingMin, 0f, 2f);
+                tune_angularDampingMin = EditorGUILayout.Slider("最小Angular Damping（震え対策）", tune_angularDampingMin, 0f, 2f);
+
+                GUILayout.Label("関節・ばね", EditorStyles.miniBoldLabel);
+                tune_springRotFloor = EditorGUILayout.Slider("ばねの最低値", tune_springRotFloor, 0f, 20f);
+                tune_angularSlackDeg = EditorGUILayout.Slider("角度制限の遊び(度)", tune_angularSlackDeg, 0f, 90f);
+
+                GUILayout.Label("コライダー・衝突", EditorStyles.miniBoldLabel);
+                tune_skirtColliderScale = EditorGUILayout.Slider("スカートのコライダー縮小率", tune_skirtColliderScale, 0.1f, 1.5f);
+                tune_hairColliderScale = EditorGUILayout.Slider("髪のコライダー縮小率", tune_hairColliderScale, 0.1f, 1.5f);
+                tune_maxDepenetrationVelocity = EditorGUILayout.Slider("めり込み解消速度の上限", tune_maxDepenetrationVelocity, 0.1f, 10f);
+
+                GUILayout.Label("マテリアル", EditorStyles.miniBoldLabel);
+                tune_outlineWidthFactor = EditorGUILayout.Slider("輪郭線の太さ換算係数", tune_outlineWidthFactor, 0.01f, 0.3f);
+
+                if (GUILayout.Button("既定値に戻す"))
+                {
+                    tune_massMin = 0.01f;
+                    tune_linearDampingMin = 0.05f;
+                    tune_angularDampingMin = 0.2f;
+                    tune_springRotFloor = 3f;
+                    tune_skirtColliderScale = 0.6f;
+                    tune_hairColliderScale = 0.85f;
+                    tune_maxDepenetrationVelocity = 1f;
+                    tune_angularSlackDeg = 45f;
+                    tune_outlineWidthFactor = 0.08f;
+                }
+                EditorGUI.indentLevel--;
+            }
 
             EditorGUILayout.Space();
 
@@ -343,8 +396,8 @@ namespace Mmd2GltfImporter
                 // スカートは体との衝突を有効にしたため、単純形状同士の重なり(めり込み)を
                 // 減らすべく縮小率を強める(0.8→0.6)。髪も同様に少し縮めて突き抜けにくくする。
                 float colliderScale = scaleFactor;
-                if (isSkirt) colliderScale = scaleFactor * 0.6f;
-                else if (isHair) colliderScale = scaleFactor * 0.85f;
+                if (isSkirt) colliderScale = scaleFactor * tune_skirtColliderScale;
+                else if (isHair) colliderScale = scaleFactor * tune_hairColliderScale;
                 AttachCollider(colObj, rbData, colliderScale);
 
                 var idxComp = colObj.AddComponent<MmdPhysicsImportIndex>();
@@ -358,23 +411,23 @@ namespace Mmd2GltfImporter
                 if (rb == null)
                 {
                     rb = boneTransform.gameObject.AddComponent<Rigidbody>();
-                    rb.mass = Mathf.Max(rbData.mass, 0.01f);
-                    rb.linearDamping = Mathf.Max(rbData.linear_damping, 0.05f);
-                    rb.angularDamping = Mathf.Max(rbData.angular_damping, 0.2f);
+                    rb.mass = Mathf.Max(rbData.mass, tune_massMin);
+                    rb.linearDamping = Mathf.Max(rbData.linear_damping, tune_linearDampingMin);
+                    rb.angularDamping = Mathf.Max(rbData.angular_damping, tune_angularDampingMin);
                     rb.isKinematic = isKinematicBody;
                 }
                 else
                 {
-                    float newMass = Mathf.Max(rbData.mass, 0.01f);
+                    float newMass = Mathf.Max(rbData.mass, tune_massMin);
                     float totalMass = rb.mass + newMass;
-                    float newLinDamp = Mathf.Max(rbData.linear_damping, 0.05f);
-                    float newAngDamp = Mathf.Max(rbData.angular_damping, 0.2f);
+                    float newLinDamp = Mathf.Max(rbData.linear_damping, tune_linearDampingMin);
+                    float newAngDamp = Mathf.Max(rbData.angular_damping, tune_angularDampingMin);
                     rb.linearDamping = (rb.linearDamping * rb.mass + newLinDamp * newMass) / totalMass;
                     rb.angularDamping = (rb.angularDamping * rb.mass + newAngDamp * newMass) / totalMass;
                     rb.mass = totalMass;
                     if (!isKinematicBody) rb.isKinematic = false; // どれか1つでも物理対象なら物理を優先
                 }
-                if (isSkirt || isHair) rb.maxDepenetrationVelocity = 1f; // 衝突再有効化に伴う初期めり込みの急激な弾けを防ぐ
+                if (isSkirt || isHair) rb.maxDepenetrationVelocity = tune_maxDepenetrationVelocity; // 衝突再有効化に伴う初期めり込みの急激な弾けを防ぐ
 
                 rigidBodyIndexToBoneRb[i] = rb;
                 createdCount++;
@@ -484,7 +537,7 @@ namespace Mmd2GltfImporter
                 //   ダンス等で脚や腰の向きが基本ポーズと大きく変わると、重力で垂れたい
                 //   スカート等がこの狭い壁に押し付けられて固まることがあるため、
                 //   少し「遊び」を追加して吸収できるようにする。
-                const float angularSlackDeg = 45f;
+                float angularSlackDeg = tune_angularSlackDeg;
 
                 var hx = joint.highAngularXLimit;
                 hx.limit = SafeGet(jd.rot_max, 0, 0f) * Mathf.Rad2Deg + angularSlackDeg;
@@ -519,8 +572,8 @@ namespace Mmd2GltfImporter
             float sx = SafeGet(springRot, 0, 0f);
             float syz = Mathf.Max(SafeGet(springRot, 1, 0f), SafeGet(springRot, 2, 0f));
 
-            sx = Mathf.Max(sx, 3f);
-            syz = Mathf.Max(syz, 3f);
+            sx = Mathf.Max(sx, tune_springRotFloor);
+            syz = Mathf.Max(syz, tune_springRotFloor);
 
             joint.rotationDriveMode = RotationDriveMode.XYAndZ;
 
@@ -635,7 +688,7 @@ namespace Mmd2GltfImporter
                 return;
             }
 
-            int converted = 0, skipped = 0, sphereApplied = 0, toonApplied = 0;
+            int converted = 0, skipped = 0, sphereApplied = 0, toonApplied = 0, outlineApplied = 0;
 
             foreach (var md in materialList)
             {
@@ -655,9 +708,16 @@ namespace Mmd2GltfImporter
                 else if (md.alphaMode == "BLEND") modeInt = 2;
                 bool isCutout = (modeInt == 1);
 
+                // ── MMD固有データを先に取得（輪郭線フラグをレンダリングモード設定時に使うため）──
+                var mmd = md.extras != null ? md.extras.mmd : null;
+
+                // ★輪郭線フラグ：MMDのflagsビットマスクのbit4(値16)が「このマテリアルは
+                //   輪郭線を描画する」を意味する。
+                bool hasOutline = mmd != null && (mmd.flags & 16) != 0;
+
                 // シェーダー未設定(初回)ならまずlilToonを割り当ててから正規セットアップを呼ぶ
                 if (mat.shader != lilShader) mat.shader = lilShader;
-                SetupLilToonRenderingMode(mat, modeInt, 0); // transparentMode=0(Normal)
+                SetupLilToonRenderingMode(mat, modeInt, 0, hasOutline); // transparentMode=0(Normal)
 
                 // ── ベースカラー ──
                 if (md.pbrMetallicRoughness != null)
@@ -678,9 +738,21 @@ namespace Mmd2GltfImporter
                 // ── 両面描画 ──
                 mat.SetFloat("_Cull", md.doubleSided ? 0f : 2f); // 0=Off(両面), 2=Back(片面)
 
-                // ── MMD固有：トゥーンテクスチャ・スフィアマップ ──
-                var mmd = md.extras != null ? md.extras.mmd : null;
+                // ── 輪郭線（アウトライン）──
+                if (hasOutline && mmd != null)
+                {
+                    mat.SetFloat("_UseOutline", 1f);
+                    if (mmd.edgeColor != null && mmd.edgeColor.Length >= 4)
+                        mat.SetColor("_OutlineColor", new Color(mmd.edgeColor[0], mmd.edgeColor[1], mmd.edgeColor[2], mmd.edgeColor[3]));
+                    // ★MMDのedgeSize(標準の太さ=1.0前後)を、lilToonの_OutlineWidth(Range 0〜1,
+                    //   既定値0.08)に換算する。MMD標準の太さ(1.0)がlilToonの既定太さ(0.08)に
+                    //   相当するとみなした簡易な比例換算。太すぎ/細すぎる場合は係数0.08を調整。
+                    float outlineWidth = mmd.edgeSize > 0 ? mmd.edgeSize * tune_outlineWidthFactor : tune_outlineWidthFactor;
+                    mat.SetFloat("_OutlineWidth", Mathf.Clamp01(outlineWidth));
+                    outlineApplied++;
+                }
 
+                // ── MMD固有：トゥーンテクスチャ・スフィアマップ ──
                 // ★診断ログ：mmdデータそのものがnullなのか、値は読めているのに
                 //   テクスチャ照合で失敗しているのかを切り分けるため。
                 if (mmd == null)
@@ -689,7 +761,7 @@ namespace Mmd2GltfImporter
                 }
                 else
                 {
-                    Debug.Log($"[MMD Material][診断] '{md.name}': sphereMode={mmd.sphereMode}, sphereTexture={mmd.sphereTexture}, toonTexture={mmd.toonTexture}, toonShared={mmd.toonShared}");
+                    Debug.Log($"[MMD Material][診断] '{md.name}': sphereMode={mmd.sphereMode}, sphereTexture={mmd.sphereTexture}, toonTexture={mmd.toonTexture}, toonShared={mmd.toonShared}, hasOutline={hasOutline}");
                 }
 
                 if (mmd != null)
@@ -707,9 +779,19 @@ namespace Mmd2GltfImporter
                     }
                     else if (mmd.toonShared >= 0)
                     {
-                        // MMD共有トゥーン(toon00〜10.bmp)は今回のglTFに画像として
-                        // 埋め込まれていないため復元できない。ログのみ残す。
-                        Debug.LogWarning($"[MMD Material] '{md.name}' は共有トゥーン(toonShared={mmd.toonShared})を使用しており、復元できません。");
+                        // MMD共有トゥーン(toon01〜10.bmp)。PMX仕様ではtoonShared=0が
+                        // toon01.bmp、9がtoon10.bmpに対応する(0始まり→1始まりのズレに注意)。
+                        var sharedTex = FindSharedToonTexture(mmd.toonShared);
+                        if (sharedTex != null)
+                        {
+                            mat.SetTexture("_ShadowColorTex", sharedTex);
+                            toonApplied++;
+                        }
+                        else
+                        {
+                            Debug.LogWarning($"[MMD Material] '{md.name}' は共有トゥーン(toonShared={mmd.toonShared})を使用していますが、" +
+                                              $"対応するtoon{(mmd.toonShared + 1):00}が見つからず復元できませんでした。");
+                        }
                     }
 
                     if (mmd.sphereTexture >= 0 && mmd.sphereMode > 0)
@@ -738,7 +820,7 @@ namespace Mmd2GltfImporter
             }
 
             AssetDatabase.SaveAssets();
-            Debug.Log($"[MMD Material] {converted}件をlilToonへ変換しました（トゥーン:{toonApplied}件, スフィア:{sphereApplied}件, スキップ:{skipped}件）。");
+            Debug.Log($"[MMD Material] {converted}件をlilToonへ変換しました（トゥーン:{toonApplied}件, スフィア:{sphereApplied}件, 輪郭線:{outlineApplied}件, スキップ:{skipped}件）。");
         }
 
         // モデルの元アセットパス(.glb)を取得する共通処理
@@ -748,7 +830,11 @@ namespace Mmd2GltfImporter
         //   それを避けるため、型名を文字列で指定するリフレクションで直接呼び出す。
         //   renderingMode: 0=Opaque, 1=Cutout, 2=Transparent
         //   transparentMode: 0=Normal
-        private void SetupLilToonRenderingMode(Material mat, int renderingMode, int transparentMode)
+        //   hasOutline: trueならアウトライン込みの実体シェーダー(例: Hidden/lilToonOutline)へ切り替える。
+        //   ★3引数版の簡易オーバーロードは isoutl 等を「共有の静的フィールド(直前にInspectorで
+        //   触った状態等)」から補うため挙動が不安定。ここでは全引数を明示するオーバーロードを
+        //   使い、ambient staticに依存しないようにする。
+        private void SetupLilToonRenderingMode(Material mat, int renderingMode, int transparentMode, bool hasOutline)
         {
             var inspectorType = System.Type.GetType("lilToon.lilToonInspector, lilToon.Editor");
             var renderingModeType = System.Type.GetType("lilToon.RenderingMode, lilToon.Editor");
@@ -767,16 +853,17 @@ namespace Mmd2GltfImporter
                 "SetupMaterialWithRenderingMode",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
                 null,
-                new System.Type[] { typeof(Material), renderingModeType, transparentModeType },
+                new System.Type[] { typeof(Material), renderingModeType, transparentModeType, typeof(bool), typeof(bool), typeof(bool), typeof(bool) },
                 null);
 
             if (method == null)
             {
-                Debug.LogError("[MMD Material] SetupMaterialWithRenderingMode メソッドが見つかりませんでした（lilToonのバージョン差異の可能性）。");
+                Debug.LogError("[MMD Material] SetupMaterialWithRenderingMode(7引数) メソッドが見つかりませんでした（lilToonのバージョン差異の可能性）。");
                 return;
             }
 
-            method.Invoke(null, new object[] { mat, renderingModeVal, transparentModeVal });
+            // isoutl=hasOutline, islite=false, istess=false, ismulti=false
+            method.Invoke(null, new object[] { mat, renderingModeVal, transparentModeVal, hasOutline, false, false, false });
         }
 
         // ★GLBの"bufferViews"/"images"/"textures"配列を読み込み、生バイナリ抽出の準備をする。
@@ -873,6 +960,36 @@ namespace Mmd2GltfImporter
 
             extractedTextureCache[textureIndex] = tex;
             return tex;
+        }
+
+        // ★MMD標準の共有トゥーン(toon01.bmp〜toon10.bmp)を、プロジェクト内から名前で探す。
+        //   toonSharedIndexは0始まり(0=toon01, 9=toon10)。ユーザーがAssets内のどこかに
+        //   toon01.bmp等を配置している前提（配置場所は問わず、ファイル名で検索する）。
+        private Texture2D FindSharedToonTexture(int toonSharedIndex)
+        {
+            if (sharedToonCache.TryGetValue(toonSharedIndex, out var cached)) return cached;
+
+            string name = $"toon{(toonSharedIndex + 1):00}"; // 0→toon01, 9→toon10
+            Texture2D found = null;
+
+            string[] guids = AssetDatabase.FindAssets($"{name} t:Texture2D");
+            foreach (var guid in guids)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                string fileName = Path.GetFileNameWithoutExtension(path);
+                if (string.Equals(fileName, name, System.StringComparison.OrdinalIgnoreCase))
+                {
+                    found = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+                    break;
+                }
+            }
+
+            if (found == null)
+                Debug.LogWarning($"[MMD Material] 共有トゥーン '{name}' がプロジェクト内に見つかりません。" +
+                                  $"Assets内のどこかに {name}.bmp（MMD標準の共有トゥーン画像）を配置してください。");
+
+            sharedToonCache[toonSharedIndex] = found;
+            return found;
         }
 
         private string GetSourceAssetPath()
