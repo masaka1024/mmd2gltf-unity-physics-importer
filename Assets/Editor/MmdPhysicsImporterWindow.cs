@@ -727,7 +727,6 @@ namespace Mmd2GltfImporter
                 int modeInt = 0;
                 if (md.alphaMode == "MASK") modeInt = 1;
                 else if (md.alphaMode == "BLEND") modeInt = 2;
-                bool isCutout = (modeInt == 1);
 
                 // ── MMD固有データを先に取得（輪郭線フラグをレンダリングモード設定時に使うため）──
                 var mmd = md.extras != null ? md.extras.mmd : null;
@@ -736,9 +735,29 @@ namespace Mmd2GltfImporter
                 //   輪郭線を描画する」を意味する。
                 bool hasOutline = mmd != null && (mmd.flags & 16) != 0;
 
+                // ★元テクスチャ温存(origTexture)対応：
+                //   エクスポーターはビューア安全のためプリベイク版(αを0/255に平坦化した
+                //   テクスチャ)を標準のbaseColorTextureに使う一方、プリベイク前の無加工版を
+                //   origTextureとしてGLBに同梱している。無加工版がある場合はそれを
+                //   実アルファブレンド(半透明+TwoPass)で使い、MMD本来の透け髪・柔らかい
+                //   眉・目の縁取りを再現する。
+                bool useOrigTexture = mmd != null && mmd.origTexture >= 0;
+                if (useOrigTexture) modeInt = 2; // MASK→Transparentへ昇格
+                bool isCutout = (modeInt == 1);
+
+                // ★半透明(BLEND)かつテクスチャありはTwoPass(2)：Normal(0)は深度書き込みが
+                //   無く、髪の房や顔パーツの重なりで描画順が狂いグレーの筋状アーティファクトが
+                //   出るため(IAモデルで実機確認済み)。テクスチャ無しの半透明(レンズ等の
+                //   単色ガラス)は従来どおりNormalでよい。
+                //   lilToon.TransparentMode: 0=Normal, 1=OnePass, 2=TwoPass
+                int transparentMode = 0;
+                bool hasBaseTex = md.pbrMetallicRoughness != null
+                    && md.pbrMetallicRoughness.baseColorTexture != null;
+                if (modeInt == 2 && (hasBaseTex || useOrigTexture)) transparentMode = 2;
+
                 // シェーダー未設定(初回)ならまずlilToonを割り当ててから正規セットアップを呼ぶ
                 if (mat.shader != lilShader) mat.shader = lilShader;
-                SetupLilToonRenderingMode(mat, modeInt, 0, hasOutline); // transparentMode=0(Normal)
+                SetupLilToonRenderingMode(mat, modeInt, transparentMode, hasOutline);
 
                 // ── ベースカラー ──
                 if (md.pbrMetallicRoughness != null)
@@ -750,6 +769,24 @@ namespace Mmd2GltfImporter
                     {
                         var tex = FindTextureByIndex(md.pbrMetallicRoughness.baseColorTexture.index);
                         if (tex != null) mat.SetTexture("_MainTex", tex);
+                    }
+                }
+
+                // ★無加工の元テクスチャがあれば_MainTexを差し替える
+                //   (プリベイク版は使わず、実アルファを持つ元画像でブレンドする)。
+                //   origテクスチャは標準マテリアルから参照されないためUnityの
+                //   glTFインポートには含まれず、GLBバイナリから直接抽出する経路
+                //   (FindOrExtractTextureByIndex)に自然に乗る。
+                if (useOrigTexture)
+                {
+                    var origTex = FindOrExtractTextureByIndex(mmd.origTexture);
+                    if (origTex != null)
+                    {
+                        mat.SetTexture("_MainTex", origTex);
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[MMD Material] '{md.name}': origTexture={mmd.origTexture} の抽出に失敗しました。プリベイク版を使用します。");
                     }
                 }
 
@@ -1679,6 +1716,13 @@ namespace Mmd2GltfImporter
         public int toonTexture = -1;   // textures配列の番号（自前テクスチャ）
         public int toonShared = -1;    // MMD共有トゥーン(toon00〜10)の番号。今回は復元非対応
         public string memo;
+        // ★エクスポーター拡張(元テクスチャ温存)対応：
+        //   alphaClass: ベーステクスチャのα分類 ("opaque"/"mask"/"blend")
+        //   origTexture: プリベイク前の無加工テクスチャのglTFテクスチャ番号(-1=なし)。
+        //   旧GLBにはこれらのフィールドが無いが、JsonUtilityは未知フィールドを
+        //   既定値のまま残すため後方互換(origTexture=-1で従来動作)。
+        public string alphaClass;
+        public int origTexture = -1;
     }
 
     // ★GLBバイナリから画像を直接抽出するためのデータクラス。
