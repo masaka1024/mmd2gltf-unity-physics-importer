@@ -269,10 +269,23 @@ namespace Mmd2GltfImporter
             }
         }
 
+        // ★extras.mmd には「raw版(rigidBodies/joints, PMX生値)」と「変換済み
+        //   physicsGltf 版」の2系統の剛体・ジョイントが併存する(extrasMmd_schema.md
+        //   参照)。本インポーターは raw 版を使う設計のため、"physicsGltf" キーより
+        //   前の範囲だけを検索対象にし、エクスポーター側のキー出力順が変わっても
+        //   誤って physicsGltf 側の配列を拾わないようにする。
+        private string GetRawPhysicsSearchText()
+        {
+            string jsonText = GetRawJsonText();
+            if (string.IsNullOrEmpty(jsonText)) return jsonText;
+            int cut = jsonText.IndexOf("\"physicsGltf\"", StringComparison.Ordinal);
+            return cut >= 0 ? jsonText.Substring(0, cut) : jsonText;
+        }
+
         private List<RigidBodyData> ExtractRigidBodies()
         {
             var bodiesList = new List<RigidBodyData>();
-            string jsonText = GetRawJsonText();
+            string jsonText = GetRawPhysicsSearchText();
             if (string.IsNullOrEmpty(jsonText)) return bodiesList;
 
             string rbArrayText = FindJsonArray(jsonText, "rigidBodies");
@@ -290,7 +303,7 @@ namespace Mmd2GltfImporter
         private List<JointData> ExtractJoints()
         {
             var list = new List<JointData>();
-            string jsonText = GetRawJsonText();
+            string jsonText = GetRawPhysicsSearchText();
             if (string.IsNullOrEmpty(jsonText)) return list;
 
             string arrText = FindJsonArrayObjects(jsonText, "joints");
@@ -852,7 +865,14 @@ namespace Mmd2GltfImporter
                         }
                     }
 
-                    if (mmd.sphereTexture >= 0 && mmd.sphereMode > 0)
+                    // ★sphereMode=3(サブテクスチャ)はUV1で貼る追加テクスチャであり、
+                    //   視線方向でサンプリングするMatCapとは仕組みが異なる。誤って
+                    //   MatCap乗算にすると見た目が大きく崩れるため適用せずスキップする。
+                    if (mmd.sphereTexture >= 0 && mmd.sphereMode == 3)
+                    {
+                        Debug.LogWarning($"[MMD Material] '{md.name}': sphereMode=3(サブテクスチャ)は未対応のためスフィアを適用しませんでした。");
+                    }
+                    else if (mmd.sphereTexture >= 0 && mmd.sphereMode > 0)
                     {
                         var sphereTex = FindOrExtractTextureByIndex(mmd.sphereTexture);
                         if (sphereTex == null)
@@ -1711,10 +1731,11 @@ namespace Mmd2GltfImporter
         public int flags;
         public float[] edgeColor;
         public float edgeSize;
-        public int sphereMode;    // 0=無効, 1=加算(仕様書記載), 2=乗算(仕様書記載)
+        public int sphereMode;    // 0=無効, 1=乗算(sph), 2=加算(spa), 3=サブテクスチャ(PMX標準仕様)
         public int sphereTexture = -1; // textures配列の番号
         public int toonTexture = -1;   // textures配列の番号（自前テクスチャ）
-        public int toonShared = -1;    // MMD共有トゥーン(toon00〜10)の番号。今回は復元非対応
+        public int toonShared = -1;    // MMD共有トゥーン番号(0始まり: 0=toon01.bmp〜9=toon10.bmp、-1=個別)。
+                                       // プロジェクト内のtoon01〜10.bmpをファイル名検索して復元する
         public string memo;
         // ★エクスポーター拡張(元テクスチャ温存)対応：
         //   alphaClass: ベーステクスチャのα分類 ("opaque"/"mask"/"blend")
