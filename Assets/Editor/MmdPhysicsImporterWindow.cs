@@ -724,8 +724,9 @@ namespace Mmd2GltfImporter
 
             int converted = 0, skipped = 0, sphereApplied = 0, toonApplied = 0, outlineApplied = 0;
 
-            foreach (var md in materialList)
+            for (int slotIdx = 0; slotIdx < materialList.Count; slotIdx++)
             {
+                var md = materialList[slotIdx];
                 if (string.IsNullOrEmpty(md.name) || !materialsByName.TryGetValue(md.name, out Material mat))
                 {
                     Debug.LogWarning($"[MMD Material] マテリアル '{md.name}' に対応するUnity Materialが見つからずスキップしました。");
@@ -758,6 +759,13 @@ namespace Mmd2GltfImporter
                 if (useOrigTexture) modeInt = 2; // MASK→Transparentへ昇格
                 bool isCutout = (modeInt == 1);
 
+                // ★alphaClass(本来のα分類)："blend"=真の半透明(透け髪・髪影・チーク等)。
+                //   無印/"mask"はカットアウト由来の昇格組(肌・服・メガネ等、見た目は
+                //   ほぼ不透明)。旧GLBはalphaClass未記載(null)だが、その場合は
+                //   mask扱いにしておけば従来より安全側になる。
+                bool trueBlend = md.alphaMode == "BLEND"
+                    || (mmd != null && mmd.alphaClass == "blend");
+
                 // ★半透明(BLEND)かつテクスチャありはTwoPass(2)：Normal(0)は深度書き込みが
                 //   無く、髪の房や顔パーツの重なりで描画順が狂いグレーの筋状アーティファクトが
                 //   出るため(IAモデルで実機確認済み)。テクスチャ無しの半透明(レンズ等の
@@ -771,6 +779,25 @@ namespace Mmd2GltfImporter
                 // シェーダー未設定(初回)ならまずlilToonを割り当ててから正規セットアップを呼ぶ
                 if (mat.shader != lilShader) mat.shader = lilShader;
                 SetupLilToonRenderingMode(mat, modeInt, transparentMode, hasOutline);
+
+                // ★レンダーキュー制御(半透明越しの消失バグ対策)：
+                //   共有テクスチャのモデル(Tda式ミクV4X等)では全マテリアルにorigTextureが
+                //   付き、全員がTransparent(q3000)へ昇格してしまう。透明キュー内は
+                //   サブメッシュ番号順+深度書き込み(TwoPass)で描画されるため、
+                //   「前髪(若い番号)の向こう側にあるメガネ(大きい番号)が深度テストに
+                //   落ちて消える」症状が起きる(V4Xで実測確認)。
+                //   対策：
+                //   ・mask由来の昇格組(見た目ほぼ不透明) → AlphaTest帯(2452+slot)。
+                //     深度を書きつつ真の半透明より先に描画されるので、透け髪や
+                //     レンズ越しに正しく見える。ブレンド自体はキューに依らず有効。
+                //   ・真の半透明(alphaClass=blend) → 3000+slot。MMDは材質順で
+                //     描画するため、スロット順を維持して本家の重なり順を再現する。
+                if (modeInt == 2)
+                {
+                    mat.renderQueue = trueBlend
+                        ? 3000 + slotIdx
+                        : Mathf.Min(2452 + slotIdx, 2499);
+                }
 
                 // ── ベースカラー ──
                 if (md.pbrMetallicRoughness != null)
