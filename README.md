@@ -1,5 +1,7 @@
 # mmd2gltf-unity-physics-importer
 
+**日本語 | [English](README.en.md)**
+
 `mmd2gltf-gui` が出力した glTF（`.glb`）を Unity に取り込んだ後、モデルの `extras` 領域に保存されている MMD 固有データ（物理演算設定・トゥーン/スフィアマテリアル設定）を読み取り、Unity 上で実際に動く形（Rigidbody・ConfigurableJoint・lilToon マテリアル）へ自動変換する Editor 拡張です。
 
 > **注意**：このツールは `mmd2gltf-gui` が出力する特定の GLB 形式（`extras.mmd` にスネークケース/キャメルケースで温存された独自データ）に依存しています。一般的な glTF エクスポーターの出力では動作しません。
