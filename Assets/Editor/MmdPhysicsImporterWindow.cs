@@ -74,6 +74,17 @@ namespace Mmd2GltfImporter
         [SerializeField] private float tune_angularDampingMin = 0.2f;     // 剛体の最小Angular Damping（髪の震え対策）
         [SerializeField] private float tune_angularDampingScale = 1f;     // Angular Damping の倍率（遅れを縮めたいときに下げる）
         [SerializeField] private float tune_linearDampingScale = 1f;      // Linear Damping の倍率
+
+        // ★減衰の忠実変換（2026-08-06、Python側エクスポーターの単位論検証で確定）。
+        //   Bullet(本家)の減衰dは「毎秒 (1-d) 倍に縮む」秒単位の定義（d=0.9=毎秒90%減）。
+        //   Unityの damping は連続減衰率（毎秒およそ e^(-D) 倍）のため、0.9 を直代入すると
+        //   毎秒約60%減にしかならず、本家よりかなり弱い＝慣性の質感が違う原因だった。
+        //   等価変換は D = -ln(1-d)（0.9→約2.30）。ただし2026-08-06のA/B検証で、PhysXでは
+        //   忠実変換ONだと全部位が硬くなり翻りが半減する(44-46°→22-28°)と実測——
+        //   PhysXの律儀な拘束解きでは、本家の強減衰を上回るエネルギー注入(Bulletの緩い
+        //   ソルバ由来)が無いため。よってPhysXバックエンドでは既定OFF(旧挙動=直代入)とし、
+        //   本家の減衰定義はv3のBullet系ソルバで真価を発揮する忠実さトグルとして残す。
+        [SerializeField] private bool  tune_damperBulletFaithful = false; // Bullet秒単位→Unity連続減衰率の換算（PhysXでは既定OFF）
         [SerializeField] private float tune_springRotFloor = 3f;          // 関節ばねの最低値
         [SerializeField] private float tune_springDamperRatio = 0.1f;     // ダンパー＝ばね×この比率（ばね0ならダンパーも0）
         [SerializeField] private bool  tune_normalizeDriveByInertia = true; // ドライブを剛体の慣性で正規化する
@@ -175,6 +186,7 @@ namespace Mmd2GltfImporter
                 tune_angularDampingMin = EditorGUILayout.Slider(L("最小Angular Damping（震え対策）", "Min Angular Damping (anti-jitter)"), tune_angularDampingMin, 0f, 2f);
                 tune_angularDampingScale = EditorGUILayout.Slider(L("Angular Damping の倍率（遅れ）", "Angular Damping Scale"), tune_angularDampingScale, 0f, 2f);
                 tune_linearDampingScale = EditorGUILayout.Slider(L("Linear Damping の倍率", "Linear Damping Scale"), tune_linearDampingScale, 0f, 2f);
+                tune_damperBulletFaithful = EditorGUILayout.Toggle(L("減衰をBullet忠実変換 D=-ln(1-d)", "Bullet-Faithful Damping D=-ln(1-d)"), tune_damperBulletFaithful);
 
                 }
 
@@ -272,6 +284,7 @@ namespace Mmd2GltfImporter
                     tune_angularDampingMin = 0.2f;
                     tune_angularDampingScale = 1f;
                     tune_linearDampingScale = 1f;
+                    tune_damperBulletFaithful = false;
                     tune_springRotFloor = 3f;
                     tune_springDamperRatio = 0.1f;
                     tune_normalizeDriveByInertia = true;
@@ -451,6 +464,7 @@ namespace Mmd2GltfImporter
                 tune_massMin.ToString("F4"), tune_inertiaScale.ToString("F3"),
                 tune_linearDampingMin.ToString("F3"), tune_angularDampingMin.ToString("F3"),
                 tune_linearDampingScale.ToString("F3"), tune_angularDampingScale.ToString("F3"),
+                tune_damperBulletFaithful ? "1" : "0",
                 tune_skirtColliderScale.ToString("F3"), tune_hairColliderScale.ToString("F3"),
                 tune_maxDepenetrationVelocity.ToString("F3"), tune_contactOffsetRatio.ToString("F3"),
                 tune_collisionDetection.ToString(), tune_useCollisionMask ? "1" : "0",
@@ -481,6 +495,16 @@ namespace Mmd2GltfImporter
                 tune_bangsHzScale.ToString("F3"), tune_bangsZetaScale.ToString("F3"), tune_bangsSlackDeg.ToString("F2"),
                 tune_sideburnsHzScale.ToString("F3"), tune_sideburnsZetaScale.ToString("F3"), tune_sideburnsSlackDeg.ToString("F2"),
             });
+        }
+
+        // ★Bullet(本家)の秒単位減衰 d を Unity の連続減衰率 D へ等価換算する。
+        //   Bullet: v ∝ (1-d)^t（d=0.9 なら毎秒90%減） / Unity: v ∝ おおよそ e^(-D·t)
+        //   等価条件 e^(-D) = 1-d より D = -ln(1-d)。d=0.9 → D≈2.30。
+        //   d=1.0 は ln が発散するため 0.999 でクランプ（D≈6.9）。
+        private static float BulletToUnityDamping(float d)
+        {
+            d = Mathf.Clamp(d, 0f, 0.999f);
+            return -Mathf.Log(1f - d);
         }
 
         // 要再構築なら色を変え、ラベルに印を付けてボタンを描く
@@ -884,18 +908,24 @@ namespace Mmd2GltfImporter
                 {
                     rb = boneTransform.gameObject.AddComponent<Rigidbody>();
                     rb.mass = Mathf.Max(rbData.mass, tune_massMin);
-                    // ★Damping はPMXの値がそのまま入る（髪は0.7前後）。慣性が1e-5オーダーの
-                    //   剛体には強く効き、親の動きへの追従が遅れる原因になる。倍率で調整できる。
-                    rb.linearDamping = Mathf.Max(rbData.linear_damping * tune_linearDampingScale, tune_linearDampingMin);
-                    rb.angularDamping = Mathf.Max(rbData.angular_damping * tune_angularDampingScale, tune_angularDampingMin);
+                    // ★Damping はPMXの値（髪は0.7前後）。慣性が1e-5オーダーの剛体には強く効き、
+                    //   親の動きへの追従が遅れる原因になる。倍率で調整できる。
+                    //   忠実変換off(既定)なら Bullet の秒単位定義を D=-ln(1-d) で換算してから
+                    //   倍率・最小値を適用する（換算後の値に対して調整が掛かる）。
+                    float srcLinDamp = tune_damperBulletFaithful ? BulletToUnityDamping(rbData.linear_damping) : rbData.linear_damping;
+                    float srcAngDamp = tune_damperBulletFaithful ? BulletToUnityDamping(rbData.angular_damping) : rbData.angular_damping;
+                    rb.linearDamping = Mathf.Max(srcLinDamp * tune_linearDampingScale, tune_linearDampingMin);
+                    rb.angularDamping = Mathf.Max(srcAngDamp * tune_angularDampingScale, tune_angularDampingMin);
                     rb.isKinematic = isKinematicBody;
                 }
                 else
                 {
                     float newMass = Mathf.Max(rbData.mass, tune_massMin);
                     float totalMass = rb.mass + newMass;
-                    float newLinDamp = Mathf.Max(rbData.linear_damping * tune_linearDampingScale, tune_linearDampingMin);
-                    float newAngDamp = Mathf.Max(rbData.angular_damping * tune_angularDampingScale, tune_angularDampingMin);
+                    float srcLinDamp2 = tune_damperBulletFaithful ? BulletToUnityDamping(rbData.linear_damping) : rbData.linear_damping;
+                    float srcAngDamp2 = tune_damperBulletFaithful ? BulletToUnityDamping(rbData.angular_damping) : rbData.angular_damping;
+                    float newLinDamp = Mathf.Max(srcLinDamp2 * tune_linearDampingScale, tune_linearDampingMin);
+                    float newAngDamp = Mathf.Max(srcAngDamp2 * tune_angularDampingScale, tune_angularDampingMin);
                     rb.linearDamping = (rb.linearDamping * rb.mass + newLinDamp * newMass) / totalMass;
                     rb.angularDamping = (rb.angularDamping * rb.mass + newAngDamp * newMass) / totalMass;
                     rb.mass = totalMass;
@@ -960,7 +990,10 @@ namespace Mmd2GltfImporter
                 Debug.Log($"[MMD Physics] 慣性テンソルを {tune_inertiaScale:F2} 倍にしました（{scaled} 体）。質量はデータのままです。");
             }
 
-            Debug.Log($"[MMD Physics] 剛体 {createdCount} 個を生成しました（Rigidbodyはボーン本体に直接付与）。");
+            Debug.Log($"[MMD Physics] 剛体 {createdCount} 個を生成しました（Rigidbodyはボーン本体に直接付与）。" +
+                      (tune_damperBulletFaithful
+                        ? "減衰はBullet忠実変換 D=-ln(1-d) で換算済みです（例: 0.9→2.30）。"
+                        : "減衰はPMX生値の直代入です（忠実変換OFF＝旧挙動）。"));
 
             // ★PMXのグループ／マスクをペア単位で再現するコンポーネントを付ける。
             //   Physics.IgnoreCollision はシーンに保存されないため、再生のたびに
