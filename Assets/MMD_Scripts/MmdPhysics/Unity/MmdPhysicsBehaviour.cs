@@ -38,7 +38,7 @@ namespace BulletPhysics.Unity
         public float Gravity = 98f;         // MMD スケール重力 (約 9.8 * 10)
         public int SolverIterations = 10;
         // ★既定 = 1/60 × SubSteps 1 (2026-08-09 ジャダー対策で 1/30×2サブ から変更)。
-        //   実効刻みは 1/60 で従来と同一 → 本家忠実度は数値まで一致することをヘッドレスで確認済み
+        //   実効刻みは 1/60 で従来と同一 → MMD忠実度は数値まで一致することをヘッドレスで確認済み
         //   (bonecheck 傾き中央11.20 / p90 23.52 / 12窓比1.0611 が変更前と同値)。CPUも同等。
         //   利点: Time.fixedDeltaTime(=1/60, 下の AlignUnityFixedTimestep が自動整列) と一致するため
         //   毎FixedUpdateでちょうど1ステップ進み、更新間隔が等間隔になる(髪/スカートのコマ落ちが消える)。
@@ -56,7 +56,7 @@ namespace BulletPhysics.Unity
         //   物理は毎回33.3ms分進むのに表示間隔が揃わない=ジャダー。
         // 対策: Time.fixedDeltaTime と FixedTimeStep を一致させ、毎FixedUpdateでちょうど1ステップ進める。
         //   FixedTimeStep=1/60・SubSteps=1 は実効刻みが現行(1/30×2サブ)と同一のため、
-        //   ヘッドレス検証で本家忠実度が完全一致することを確認済み (傾き11.20/p90 23.52/12窓比1.0611)。CPUも同等。
+        //   ヘッドレス検証でMMD忠実度が完全一致することを確認済み (傾き11.20/p90 23.52/12窓比1.0611)。CPUも同等。
         // ★既定ON (2026-08-09)。Unity全体の物理刻み(Time.fixedDeltaTime)を FixedTimeStep に合わせる。
         //   既定 0.02(50Hz) → 1/60(60Hz) になる。Custom運用では PhysX はパーク済みなので実害はない。
         //   他のFixedUpdate処理も60Hzになる点だけ留意 (呼び出し回数が2割増)。OFFにすると未整列時に警告のみ。
@@ -74,14 +74,14 @@ namespace BulletPhysics.Unity
         //     接触のみ       |v|0.714 |w|1.314
         //     両方ON         |v|0.576 |w|0.943   ← 約3割減
         //   ※ソルバ反復を10→40にしても改善しない(むしろ微増)=収束不足ではない。
-        //   既定OFF=従来の挙動のまま(本家Bullet2.75の接触も非split)。見た目をA/Bして決めること。
+        //   既定OFF=従来の挙動のまま(Bullet 2.75の接触も非split)。見た目をA/Bして決めること。
         [Tooltip("ジョイントの位置補正を擬似速度へ分離する。静止時のジッタが減る。既定OFF=従来挙動")]
         public bool JointSplitImpulse = false;
-        [Tooltip("接触の位置補正を擬似速度へ分離する。既定OFF=本家Bullet2.75準拠")]
+        [Tooltip("接触の位置補正を擬似速度へ分離する。既定OFF=Bullet 2.75準拠")]
         public bool ContactSplitImpulse = false;
 
-        // Bullet のスリープ(非活性化)。静止した剛体を計算から外す。本家は有効
-        // (ユーザー実機で本家IAの序盤=静止ポーズ中に髪の揺れが止まることを確認)。
+        // Bullet のスリープ(非活性化)。静止した剛体を計算から外す。MMDは有効
+        // (ユーザー実機でMMDのIAの序盤=静止ポーズ中に髪の揺れが止まることを確認)。
         // ★既定OFF: 実装済みだが現状ほとんど発動しない。当エンジンの静止時の残留運動が
         //   Bullet のしきい値を超えているため (IA |w|平均1.5 > しきい値1.0、101体中2体しか眠らない)。
         //   残留を下げるのが先。しきい値を緩めれば眠るが、動くべき揺れ物が固まる危険がある。
@@ -100,23 +100,23 @@ namespace BulletPhysics.Unity
         public int PoseResetDelayFrames = 2;
 
         // ★PMX mode2 (物理演算+ボーン位置合わせ) の実装 (2026-08-10)。
-        //   mode2 剛体は「位置はボーン階層から、回転は物理から」が本家の仕様。従来これが未実装で
-        //   mode1 と同じ完全自由になっていたため、スカートが本家より柔らかかった
+        //   mode2 剛体は「位置はボーン階層から、回転は物理から」がMMDの仕様。従来これが未実装で
+        //   mode1 と同じ完全自由になっていたため、スカートがMMDより柔らかかった
         //   (Tda式初音ミクV4X はスカート66個中32個が mode2。実測で揺れ幅 0.257→0.188)。
         //   既定ON。mode2 剛体を持たないモデル(IA等)では何もしないので無影響。
         //   OFF にすると従来どおり mode2 を mode1 と同じ扱いにする (A/B 比較用)。
         [Tooltip("PMX mode2(物理演算+ボーン位置合わせ)を再現する。OFFで従来どおりmode1と同一扱い")]
         public bool EnableBoneMergeMode = true;
 
-        [Header("Correction (本家PMXエディタの補正層再現)")]
+        [Header("Correction (PmxEditorの補正層再現)")]
         // [物理+ボーン位置合わせ] 再現: 書き戻し時、位置を「親ボーン(補正済)位置+親回転×bindオフセット」の
         // 階層再構成に置換し、物理の移動分を捨てる (回転は物理のまま)。補正OFF/ON対照データで式を確定済み。
         // 既定 false=従来(物理位置をそのまま書き戻し)。ヘルパは PmxPhysicsBuilder.ComputeAlignedBonePoses (共通)。
-        [Tooltip("本家の[ボーン位置合わせ]再現: 位置=親チェーン再構成(移動分を捨てる)/回転=物理。スカート/髪の貫通表示対策。")]
+        [Tooltip("MMDの[ボーン位置合わせ]再現: 位置=親チェーン再構成(移動分を捨てる)/回転=物理。スカート/髪の貫通表示対策。")]
         public bool AlignBonePositions = false;
 
         // [Jointロック内部演算] 再現の第一形: 親側ジョイントの相対eulerをリミット超過分だけ α で戻す。
-        // 0=無効(回転そのまま) / 1=完全clamp。本家ONの超過8-14°は完全clampでないことを示すため中間値。
+        // 0=無効(回転そのまま) / 1=完全clamp。MMD(補正ON)の超過8-14°は完全clampでないことを示すため中間値。
         // AlignBonePositions とセットで使う (位置だけONは有害と実測済: 深貫入47,749)。掃引結果で既定を更新予定。
         [Tooltip("回転をジョイント角度リミットへ戻す割合 (AlignBonePositionsとセットで使用)。0=無効, 1=完全clamp。")]
         [Range(0f, 1f)] public float AlignRotClampAlpha = 0.5f;
@@ -361,7 +361,7 @@ namespace BulletPhysics.Unity
             // ★PMX mode2 (DynamicBoneMerge = 物理演算+ボーン位置合わせ) の実装 (2026-08-10)。
             //   mode2 は「ボーンへの出力で、位置だけを親チェーン由来にし、回転は物理のまま」という
             //   *書き戻し側* の仕様であって、シミュレーションを拘束するものではない。
-            //   ComputeAlignedBonePoses が元からその計算 (本家PMXエディタの補正層再現) をしており、
+            //   ComputeAlignedBonePoses が元からその計算 (PmxEditorの補正層再現) をしており、
             //   従来は AlignBonePositions という全剛体一律のトグルにだけ繋がれていた。
             //   ここで mode2 の剛体に限り常時適用する。
             //   ※最初の実装で「剛体そのものを毎ステップ位置固定し並進速度をゼロにする」方式を試したが、

@@ -112,7 +112,7 @@ namespace BulletPhysics.Pmx
         ///   - 物理で動くボーン (動的剛体が紐づくボーン) は、外から与えられた姿勢を使わず、
         ///     親チェーンから前計算する (バインドは位置のみ・回転恒等なので単純な階層合成)。
         ///   - 駆動されるボーン (kinematic 剛体のボーン等) は getDrivenBoneWorld の姿勢を使う。
-        /// これにより、CSV(本家の物理結果=傾き込み)を全剛体へ一斉適用したときの過拘束発散を避け、
+        /// これにより、CSV(MMDの物理結果=傾き込み)を全剛体へ一斉適用したときの過拘束発散を避け、
         /// BonePoseCsvPlayer / HeadlessDriver / Unity で同一の開始状態を作れる。
         /// getDrivenBoneWorld: ボーンindex → 駆動姿勢 (無ければ null)。物理ボーンには使われない。
         /// </summary>
@@ -182,10 +182,10 @@ namespace BulletPhysics.Pmx
         private bool _hasBoneMerge;
 
         /// <summary>
-        /// [物理+ボーン位置合わせ] 再現 (本家PMXエディタの補正層。補正OFF/ON対照データで式を確定, 2026-08-09):
+        /// [物理+ボーン位置合わせ] 再現 (PmxEditorの補正層。補正OFF/ON対照データで式を確定, 2026-08-09):
         ///   物理ボーンの出力姿勢 = 位置: 親ボーン(補正済)の位置 + 親回転で回した bind オフセット
         ///                          (物理の「移動分」を捨てる) / 回転: 物理回転そのまま。
-        /// 検証: |ON子-(ON親+qON親·bindRel)| = skirt中央0.011 (本家ONでほぼ厳密成立, OFFは0.072)。
+        /// 検証: |ON子-(ON親+qON親·bindRel)| = skirt中央0.011 (MMD(補正ON)でほぼ厳密成立, OFFは0.072)。
         /// 駆動ボーンは getDrivenBoneWorld、物理ボーンの回転は剛体から復元 (body * offset^-1)。
         /// 書き戻しは HeadlessDriver / MmdPhysicsBehaviour / 計測ハーネスで必ず本ヘルパを共用する
         /// (FK-rest リセットと同じ扱い。経路差のバグを避ける)。戻り値: boneIndex -> 補正済world姿勢。
@@ -193,7 +193,7 @@ namespace BulletPhysics.Pmx
         /// <param name="getDrivenBoneWorld">駆動ボーンの現在world姿勢 (null=バインド)。</param>
         /// <param name="rotClampAlpha">回転clamp割合 (0=無効=回転そのまま / 1=リミットへ完全clamp)。
         ///   [Jointロック内部演算] 再現の第一形: 親側ジョイントの相対euler(補正済親フレーム基準)を
-        ///   リミット超過分だけ α で戻す。本家ONの超過8-14°は完全clampでないことを示すため中間αを掃引する。</param>
+        ///   リミット超過分だけ α で戻す。MMD(補正ON)の超過8-14°は完全clampでないことを示すため中間αを掃引する。</param>
         /// 順序比較(位置を物理回転で再構成→回転のみclamp)は、呼び出し側で α=0 と α>0 の2回呼びを合成する。
         public RigidTransform?[] ComputeAlignedBonePoses(System.Func<int, RigidTransform?> getDrivenBoneWorld,
             float rotClampAlpha = 0f)

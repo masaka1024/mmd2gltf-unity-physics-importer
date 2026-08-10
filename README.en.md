@@ -6,6 +6,12 @@ A Unity Editor extension that reads the MMD-specific data preserved in the `extr
 
 > **Note**: This tool depends on the specific GLB layout produced by `mmd2gltf-gui` (custom data preserved under `extras.mmd`). It will not work with output from generic glTF exporters.
 
+> **This is an unofficial, independent personal project.**
+> It is not affiliated with, endorsed by, or supported by MikuMikuDance (Yu Higuchi),
+> PmxEditor (Kyokuhoku-P), Bullet Physics, or any model/motion author. Names such as
+> "MMD" and "PMX" are used only to refer to the formats and to the software being compared
+> against. Behavioural parity is a goal, not a guarantee.
+
 ---
 
 ## Features
@@ -13,7 +19,7 @@ A Unity Editor extension that reads the MMD-specific data preserved in the `extr
 ### Physics
 
 Reads PMX rigid bodies and joints and drives them with a **custom Bullet-compatible physics engine** (`Assets/MMD_Scripts/MmdPhysics/`, bundled). One button wires everything up and secondary animation (hair, skirts, ribbons) comes alive.
-Stock MMD behaviour is the target, but this is **not on par with it** (see "Known limitations").
+MMD behaviour is the target, but this is **not on par with it** (see "Known limitations").
 
 - Reproduces PMX rigid bodies, joints, and physics modes (bone-follow / dynamic / dynamic + bone position merge)
 - Pure C#; no native dependency (no BulletSharp etc.)
@@ -103,9 +109,9 @@ Earlier versions drove secondary animation with Unity `Rigidbody` + `Configurabl
 The custom Bullet-compatible engine now produces **noticeably closer-to-MMD behaviour than the PhysX
 path did in practice**, so **the PhysX path has been removed** to avoid maintaining two implementations.
 
-> This does not mean it matches stock MMD. Numerical fidelity has only ever been validated against a
+> This does not mean it matches MMD. Numerical fidelity has only ever been validated against a
 > single model (IA), those numbers predate recent fixes, and some aspects — such as jitter at rest —
-> are still **worse** than stock MMD (see "Known limitations").
+> are still **worse** than MMD (see "Known limitations").
 
 | | Old | Current |
 |---|---|---|
@@ -135,7 +141,7 @@ Layout differs slightly: the engine repo uses `Assets/MmdPhysics/{Core,Pmx,Unity
 
 ## Known limitations
 
-- **Jitter at rest**: secondary animation vibrates slightly more than stock MMD even when nearly static. This is an open issue in the engine (position correction feeds energy back into real velocity). See "静止時のジッタ" in the engine repo README.
+- **Jitter at rest**: secondary animation vibrates slightly more than MMD even when nearly static. This is an open issue in the engine (position correction feeds energy back into real velocity). See "静止時のジッタ" in the engine repo README.
 - **Skirt physics**: approximated with simple sphere/box/capsule colliders, so collision and interpenetration are less natural than for hair.
 - **`ambient` / `specular`**: lilToon has no equivalent of MMD's coloured highlight, so these are unsupported.
 - **Shared toons**: the images are not included here (they ship with MMD). You must supply them.

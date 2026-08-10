@@ -13,7 +13,7 @@ using BulletPhysics.Unity; // 自作Bulletエンジンの Unity ブリッジ（M
 //
 // ★2026-08-10：PhysX経路を撤去した。
 //   かつてこのウィンドウの主機能は「Unity Rigidbody + ConfigurableJoint をボーンに直付けして
-//   PhysXで揺らす」ことだった(mmd-for-unity 方式)。自作Bulletエンジンが本家MMD/PMXエディタの
+//   PhysXで揺らす」ことだった(mmd-for-unity 方式)。自作BulletエンジンがMMD / PmxEditorの
 //   挙動に到達したため主経路を入れ替え、さらに二重メンテを避けるため PhysX 側を削除した。
 //   これに伴い以下を除去:
 //     - 剛体生成 / ジョイント結合 / コライダー配置 / レイヤー管理 (約1,900行)
@@ -448,7 +448,7 @@ namespace Mmd2GltfImporter
                 //     深度を書きつつ真の半透明より先に描画されるので、透け髪や
                 //     レンズ越しに正しく見える。ブレンド自体はキューに依らず有効。
                 //   ・真の半透明(alphaClass=blend) → 3000+slot。MMDは材質順で
-                //     描画するため、スロット順を維持して本家の重なり順を再現する。
+                //     描画するため、スロット順を維持してMMDの重なり順を再現する。
                 if (modeInt == 2)
                 {
                     mat.renderQueue = trueBlend

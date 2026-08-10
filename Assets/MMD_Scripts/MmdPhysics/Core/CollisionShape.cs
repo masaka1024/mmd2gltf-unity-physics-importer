@@ -137,9 +137,9 @@ namespace BulletPhysics
             // Bullet は「両端の球を含む外接箱」の慣性で近似している
             // (原文コメント: "as an approximation, take the inertia of the box that
             //  bounds the spheres")。物理的に正しい円柱+半球の解析式ではないが、
-            // 本家(Bullet 2.75/PMX)との挙動互換を優先し、あえてこの近似を使う。
+            // MMD(Bullet 2.75/PMX)との挙動互換を優先し、あえてこの近似を使う。
             // ※ 将来「正しい式」に直さないこと。円柱式は横軸慣性が半分以下になり、
-            //   カプセル剛体(髪など)が本家より過敏に回ってしまう。
+            //   カプセル剛体(髪など)がMMDより過敏に回ってしまう。
             // upAxis は Y (PMX のカプセルは Y 軸方向)。halfExtents = (r,r,r) の Y に halfHeight を加算。
             var r = Radius;
             var hx = r;

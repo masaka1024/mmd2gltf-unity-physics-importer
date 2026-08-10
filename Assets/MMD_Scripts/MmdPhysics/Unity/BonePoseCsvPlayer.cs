@@ -1,8 +1,8 @@
 // ===========================================================================
 // ボーン姿勢CSV 再生コンポーネント (目視確認用)。
-// 本家ベイク済みのボーン世界姿勢CSVで PMX 物理を駆動し、ヘッドレス(HeadlessDriver)と
-// 同一入力・同一ロジックで同じ動きを Unity 上に再現する。さらに、CSVに含まれる本家の
-// スカートボーン姿勢から「本家スカート剛体」をゴースト(別色)で重ね描きし、自前物理との
+// MMDでベイクしたのボーン世界姿勢CSVで PMX 物理を駆動し、ヘッドレス(HeadlessDriver)と
+// 同一入力・同一ロジックで同じ動きを Unity 上に再現する。さらに、CSVに含まれるMMDの
+// スカートボーン姿勢から「MMDのスカート剛体」をゴースト(別色)で重ね描きし、自前物理との
 // ズレを目視で比較できるようにする。
 //
 // 操作は Inspector の右クリック(ContextMenu)で行う (Input/GUI 非依存):
@@ -23,7 +23,7 @@ namespace BulletPhysics.Unity
         [Header("入力 (各自の環境のパスを Inspector で設定)")]
         [Tooltip("読み込む .pmx ファイルのパス。空なら何もせず警告のみ (落ちない)")]
         public string PmxPath = "";
-        [Tooltip("本家ベイク済みボーン世界姿勢CSVのパス。空/未存在なら物理のみ動きゴースト無し (落ちない)")]
+        [Tooltip("MMDでベイクしたボーン世界姿勢CSVのパス。空/未存在なら物理のみ動きゴースト無し (落ちない)")]
         public string BoneCsvPath = "";
 
         [Header("Solver (リファレンス=実効1/60: FTS=1/30, SubSteps=2)")]
@@ -40,7 +40,7 @@ namespace BulletPhysics.Unity
         [Tooltip("エンジン(PMXネイティブ単位) -> Unity 配置スケール")]
         public float UnitScale = 0.08f;
         public bool DrawSelf = true;
-        [Tooltip("本家スカート剛体をゴースト(マゼンタ)で重ね描き")]
+        [Tooltip("MMDのスカート剛体をゴースト(マゼンタ)で重ね描き")]
         public bool DrawReferenceGhost = true;
         [Tooltip("ゴーストをスカート(CSVに含まれるボーン)に限定")]
         public bool SkirtOnlyGhost = true;
@@ -52,7 +52,7 @@ namespace BulletPhysics.Unity
         [Tooltip("現在ワールドが到達しているフレーム (表示専用。移動は下の ContextMenu で)")]
         public int Frame = 0;
 
-        [Header("窓6 コマ送り (自前92.2°/本家62.9°の確認)")]
+        [Header("窓6 コマ送り (自前92.2°/MMD62.9°の確認)")]
         public int WindowStart = 2440;
         public int WindowEnd = 2470;
 
@@ -284,7 +284,7 @@ namespace BulletPhysics.Unity
 
             DrawSceneLabel();
 
-            // 本家ゴースト: CSVのボーン姿勢 * オフセット で剛体位置を復元しマゼンタで重ね描き。
+            // MMDゴースト: CSVのボーン姿勢 * オフセット で剛体位置を復元しマゼンタで重ね描き。
             if (DrawReferenceGhost && _csv != null && _simFrame >= 0)
             {
                 Gizmos.color = Color.magenta;
