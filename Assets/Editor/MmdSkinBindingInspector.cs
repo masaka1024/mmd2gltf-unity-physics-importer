@@ -8,7 +8,8 @@ namespace Mmd2GltfImporter
 {
     /// <summary>
     /// スキン結線検査：SkinnedMeshRendererが参照しているボーン(bones配列＋ウェイト)と、
-    /// Rigidbodyが乗っているTransformが同一かを機械的に突き合わせる。
+    /// 揺れ物ボーンが同一かを機械的に突き合わせる。
+    /// （揺れ物の定義は GLB の extras.mmd 由来。MmdEditorShared.TryCollectSwayBones を参照）
     ///
     /// 背景：物理(剛体)は動き、クリップにも揺れ物カーブが無いのに絵が動かない場合、
     /// 「メッシュが物理の乗っているボーンにスキニングされていない」断線が疑われる。
@@ -18,7 +19,7 @@ namespace Mmd2GltfImporter
     /// </summary>
     public class MmdSkinBindingInspector : EditorWindow
     {
-        [MenuItem("MMD Physics/スキン結線検査")]
+        [MenuItem("MMD Physics/スキン結線検査", false, 21)]
         public static void ShowWindow()
         {
             GetWindow<MmdSkinBindingInspector>("スキン結線検査");
@@ -31,9 +32,10 @@ namespace Mmd2GltfImporter
         private void OnGUI()
         {
             EditorGUILayout.HelpBox(
-                "SkinnedMeshRendererの参照ボーンと、Rigidbodyが乗っているTransformが\n" +
-                "同一インスタンスかを検査します。別物なら、物理がいくら動いても\n" +
-                "メッシュは動きません（＝数字だけ動いて絵が鉄壁になる断線）。",
+                "SkinnedMeshRendererの参照ボーンと、揺れ物ボーンが同一インスタンスかを\n" +
+                "検査します。別物なら、物理がいくら動いてもメッシュは動きません\n" +
+                "（＝数字だけ動いて絵が鉄壁になる断線）。\n" +
+                "揺れ物は GLB の extras.mmd（物理演算剛体 mode≠0）から特定します。",
                 MessageType.Info);
 
             modelRoot = (GameObject)EditorGUILayout.ObjectField("モデル (Scene上)", modelRoot, typeof(GameObject), true);
@@ -51,19 +53,19 @@ namespace Mmd2GltfImporter
             }
         }
 
-        private static string LabelOf(string name)
-        {
-            if (name.Contains("スカート")) return "スカート";
-            if (name.Contains("髪") || name.Contains("前髪") || name.Contains("もみあげ") || name.Contains("モミアゲ")) return "髪";
-            return "その他揺れ物";
-        }
+        private static string LabelOf(string name) => MmdEditorShared.ClassifyPart(name);
 
         private void Inspect()
         {
-            // 1) 揺れ物（非Kinematic Rigidbody）のTransformを収集
-            var swayBones = new List<Transform>();
-            foreach (var rb in modelRoot.GetComponentsInChildren<Rigidbody>())
-                if (!rb.isKinematic) swayBones.Add(rb.transform);
+            // 1) 揺れ物ボーンを GLB の extras.mmd から収集（定義は MmdEditorShared 参照）。
+            //    ここが 0 件のまま先へ進むと「断線なし」と誤診するので、理由を出して止める。
+            if (!MmdEditorShared.TryCollectSwayBones(modelRoot, out var swayMap, out string collectError))
+            {
+                lastReport = "★検査できません: 揺れ物ボーンを特定できませんでした。\n  " + collectError;
+                Debug.LogWarning("[スキン結線検査] " + collectError);
+                return;
+            }
+            var swayBones = new List<Transform>(swayMap.Keys);
 
             // 2) 全SkinnedMeshRendererから「参照されているボーン→合計ウェイト」を作る
             //    （bones配列に居ても実ウェイト0なら絵は動かないため、両方を見る）

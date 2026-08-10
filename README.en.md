@@ -2,107 +2,155 @@
 
 **[日本語](README.md) | English**
 
-An Editor extension that, after importing a glTF (`.glb`) produced by `mmd2gltf-gui` into Unity, reads the MMD-specific data stored in the model's `extras` field (physics settings, toon/sphere material settings) and automatically converts it into something that actually works in Unity (`Rigidbody` / `ConfigurableJoint`, lilToon materials).
+A Unity Editor extension that reads the MMD-specific data preserved in the `extras` region of a glTF (`.glb`) exported by `mmd2gltf-gui` — rigid-body physics settings and toon/sphere material settings — and converts them into something that actually runs in Unity.
 
-> **Note:** This tool depends on the specific GLB layout produced by `mmd2gltf-gui` (custom data preserved under `extras.mmd` in snake_case/camelCase). It will not work with output from generic glTF exporters.
+> **Note**: This tool depends on the specific GLB layout produced by `mmd2gltf-gui` (custom data preserved under `extras.mmd`). It will not work with output from generic glTF exporters.
 
 ---
 
-## What it does
+## Features
 
 ### Physics
-- Reads MMD rigid-body and joint settings and automatically generates Unity `Rigidbody` / `ConfigurableJoint` components
-- Attaches Rigidbody directly to the bone Transforms that actually drive the mesh (a design inspired by [mmd-for-unity](https://github.com/ousttrue/mmd-for-unity)), so secondary-motion physics is reflected straight onto the mesh
-- Separates hair and skirts into dedicated collision layers to reduce runaway tangling and clipping into the body
-- Various parameters (minimum damping to prevent jitter, joint play, collider shrink ratio, etc.) can be tuned on the fly with sliders in the GUI
+
+Reads PMX rigid bodies and joints and drives them with a **custom Bullet-compatible physics engine** (`Assets/MMD_Scripts/MmdPhysics/`, bundled). One button wires everything up, and secondary animation (hair, skirts, ribbons) moves close to stock MMD.
+
+- Reproduces PMX rigid bodies, joints, and physics modes (bone-follow / dynamic / dynamic + bone position merge)
+- Pure C#; no native dependency (no BulletSharp etc.)
+- Unity's PhysX is not used (see "Migration from PhysX" below)
 
 ### Materials
-- Automatic conversion to [lilToon](https://github.com/lilxyzw/lilToon) (URP-compatible)
-- Restores MMD toon textures, sphere maps (additive/multiplicative), and outline (edge) rendering
-- Extracts toon/sphere textures directly from the GLB binary, since UniGLTF does not import them
-- Supports MMD's standard shared toons (`toon01`–`toon10`) as well (using images the user supplies separately)
-- Conversion results are saved as independent `.mat` assets, so they survive project re-imports
+
+- Automatic conversion to [lilToon](https://github.com/lilxyzw/lilToon) (URP)
+- Restores MMD toon textures, sphere maps (add/multiply), and outlines
+- Extracts toon/sphere textures directly from the GLB binary (UniGLTF does not import them)
+- Supports MMD's shared toons (`toon01`–`toon10`) using images you supply
+- Results are saved as standalone `.mat` assets that survive re-import
+
+### In-game hitboxes
+
+Generates **detection-only colliders** from the PMX rigid-body definitions. These are separate from the physics simulation and are meant for hit detection in shooters/action games.
+
+- Selectable scope (body parts only / hair & skirt only / all)
+- Creates `isTrigger` colliders and **no Rigidbody**. They are simply parented to bones, so they add no physics cost and follow whether the bone is driven by the Animator or by physics
+- Identify what was hit via `MmdHitbox.PartName` (`頭` / `上半身2` / `右ひざ` …)
+
+```csharp
+void OnTriggerEnter(Collider other) {
+    var hit = other.GetComponent<MmdHitbox>();
+    if (hit == null) return;
+    damage *= hit.PartName == "頭" ? 2f : 1f;   // per-part damage
+}
+```
+
+### Diagnostics
+
+- **Clip inspector** — detects AnimationClip curves targeting secondary-animation bones and can produce a stripped copy
+- **Skin binding inspector** — cross-checks SkinnedMeshRenderer bone references against the physics-driven bones
+- Raw JSON dumps from the GLB (joints / materials / texture mapping / bone rotations)
 
 ### UI
-- Japanese / English toggle button
-- A collapsible set of debugging tools (raw JSON inspection, bulk bone-rotation output, etc.)
+
+- Japanese / English toggle
 
 ---
 
 ## Requirements
 
-- Unity (a project using the Universal Render Pipeline)
-- [UniGLTF](https://github.com/vrm-c/UniVRM) (used for glTF import)
-- [lilToon](https://github.com/lilxyzw/lilToon) (used for material conversion; not needed if you only use the physics features)
-- A `.glb` file converted with `mmd2gltf-gui`
+- Unity with the Universal Render Pipeline (targeting Unity 6)
+- [UniGLTF](https://github.com/vrm-c/UniVRM) for glTF import
+- [lilToon](https://github.com/lilxyzw/lilToon) for material conversion (not needed if you only want physics)
+- A `.glb` produced by `mmd2gltf-gui`
 
 ---
 
 ## Setup
 
-Place the following 3 files in your project.
+**Copy the contents of `Assets/` into your project's `Assets/`.**
 
-| File | Location |
-|---|---|
-| `MmdPhysicsImporterWindow.cs` | under `Assets/Editor/` |
-| `PhysicsGltfData.cs` | outside `Assets/Editor/` (a regular folder) |
-| `MmdPhysicsImportIndex.cs` | outside `Assets/Editor/` (a regular folder) |
+```
+Assets/
+  Editor/                     Editor extensions (importer window, diagnostics)
+  MMD_Scripts/
+    MmdHitbox.cs              Hitbox marker (runtime)
+    FreeCameraController.cs   Free camera for inspection
+    MmdPhysics/               Physics engine (Core / Pmx / Unity)
+```
 
-If you want to restore the shared toons, place the `toon01.bmp`–`toon10.bmp` files (10 total) that ship with MMD itself anywhere under `Assets` (they are located automatically by filename, so the exact location doesn't matter).
+> Everything under `Editor/` is editor-only. Everything under `MMD_Scripts/` is needed at runtime, so it must stay **outside** any `Editor` folder (otherwise you get missing references at play time).
+
+To restore shared toons, place `toon01.bmp`–`toon10.bmp` (shipped with MMD) anywhere under `Assets` — they are located by filename.
 
 ---
 
 ## Usage
 
-1. Open `MMD > Physics Importer` from the Unity menu
-2. Set your target model in the "Target Model" field in the Scene
-3. Adjust parameters in the "Tuning Panel" as needed
-4. Run **Button 1** (place rigid bodies and colliders) → **Button 2** (connect joints), in that order
-5. Run **Button 3** (convert materials to lilToon) — independent of the physics setup, can be run at any time
+1. Import the `.glb` and place the model in the scene
+2. Open **`MMD Physics > インポーター`** from the menu
+3. Assign the scene model to the target field
+4. **[1] Wire / Re-wire Physics** — this alone makes physics work
+5. **[2] Convert Materials to lilToon** — independent of physics, run any time
+6. **[3] Build Hitboxes** — only if you need them
+
+Fine-tuning of physics (timestep, penetration handling) lives on the `MmdPhysicsBehaviour` component added by step 1.
+
+---
+
+## Migration from PhysX (2026-08-10)
+
+Earlier versions drove secondary animation with Unity `Rigidbody` + `ConfigurableJoint` (PhysX) and exposed 49 tuning sliders (springs, damping, soft limits, per-part dials).
+
+Now that the custom Bullet-compatible engine matches stock MMD behaviour, **the PhysX path has been removed**.
+
+| | Old | Current |
+|---|---|---|
+| Physics | Unity PhysX | Custom Bullet-compatible engine |
+| Steps | bodies → joints → materials | wire physics → materials |
+| Tuning sliders | 49 | 0 (physics settings moved to `MmdPhysicsBehaviour`) |
+| Importer window | 3,541 lines | 1,160 lines |
+
+**When updating from an older version**, manually remove any leftover `Rigidbody` / `ConfigurableJoint` components and the deleted helper scripts (`MmdGravity`, `MmdPhysicsWarmup`, `MmdCollisionMask`, …) from your scenes. Otherwise you will be left with `Missing (Mono Script)` entries and orphaned components.
+
+---
+
+## About the physics engine
+
+The bundled `Assets/MMD_Scripts/MmdPhysics/` is a copy of an engine developed in its own repository.
+
+**Source of truth: https://github.com/masaka1024/mmd2gltf-cs-physics**
+
+> ⚠ **Fixes must be applied to both repositories.** After changing the engine, mirror the change into
+> `Assets/MMD_Scripts/MmdPhysics/` here (the two are kept file-for-file identical).
+> Design notes, measurements, and "things we tried that failed" live in the engine repo's `docs/`.
+
+Layout differs slightly: the engine repo uses `Assets/MmdPhysics/{Core,Pmx,Unity,DevTools}`, while here it is
+`Assets/MMD_Scripts/MmdPhysics/{Core,Pmx,Unity}` (the two `DevTools` files sit in `Unity/`; contents are identical).
 
 ---
 
 ## Known limitations
 
-- **Skirt physics**: Approximated with simple sphere/box/capsule colliders, so collision and clipping behavior is not as natural as for hair. A switch to cloth simulation or similar is being considered for the future.
-- **`ambient` / `specular` material settings**: lilToon has no property equivalent to MMD's colored highlights, so these are currently unsupported.
-- **Shared toons**: The image files themselves are not included in this repository (they are part of MMD's own distribution). Users need to supply them separately.
-- **UniGLTF morph import**: Models exported from `mmd2gltf-gui` with `morph_mode="sparse"` (delta compression) can show broken-looking morphs. This has been identified as UniGLTF not correctly loading sparse-format morph targets. `morph_mode="dense"` is recommended at export time.
+- **Jitter at rest**: secondary animation vibrates slightly more than stock MMD even when nearly static. This is an open issue in the engine (position correction feeds energy back into real velocity). See "静止時のジッタ" in the engine repo README.
+- **Skirt physics**: approximated with simple sphere/box/capsule colliders, so collision and interpenetration are less natural than for hair.
+- **`ambient` / `specular`**: lilToon has no equivalent of MMD's coloured highlight, so these are unsupported.
+- **Shared toons**: the images are not included here (they ship with MMD). You must supply them.
+- **UniGLTF morph import**: models exported with `morph_mode="sparse"` may show broken morphs — UniGLTF does not read sparse morph targets correctly. Use `morph_mode="dense"`.
 
 ---
 
 ## Design background
 
-This tool was originally implemented using a "create a dedicated object for the swaying rigid body, and write its pose back to the bone every frame" approach, but this caused frequent issues from feedback loops and self-referencing loops. It has since been rebuilt from the ground up based on the design of [mmd-for-unity](https://github.com/ousttrue/mmd-for-unity) (attaching Rigidbody directly to the bone itself). This design eliminates the need for a dedicated write-back process and has greatly stabilized the behavior of secondary motion.
+The tool started by creating dedicated rigid-body objects and writing their poses back to bones every frame, then was rebuilt around attaching `Rigidbody` directly to bones (inspired by [mmd-for-unity](https://github.com/ousttrue/mmd-for-unity)) on PhysX. It now replaces the physics itself with the custom engine.
+
+Physics results are written back to bones in **`LateUpdate`**. Writing in `FixedUpdate` lets the Animator overwrite them every frame whenever the clip has curves for secondary-animation bones — even constant rest-pose keys are enough to hide the physics completely.
 
 ---
 
 ## Credits
 
-- The physics design is based on [mmd-for-unity](https://github.com/ousttrue/mmd-for-unity)
+- Physics design originally referenced [mmd-for-unity](https://github.com/ousttrue/mmd-for-unity)
 - Material conversion uses [lilToon](https://github.com/lilxyzw/lilToon)
-- The input `.glb` is expected to be generated by the author's own `mmd2gltf-gui` tool (a PMX/VMD → glTF 2.0 converter)
+- Input `.glb` files are expected from `mmd2gltf-gui` (PMX/VMD → glTF 2.0 converter)
 
 ## License
 
-MIT License
-
-Copyright (c) 2026 masaka1024
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT License / Copyright (c) 2026 masaka1024 — see [LICENSE](LICENSE) for the full text.

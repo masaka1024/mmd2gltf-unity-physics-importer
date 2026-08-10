@@ -7,8 +7,9 @@ using UnityEngine;
 namespace Mmd2GltfImporter
 {
     /// <summary>
-    /// クリップ診断：AnimationClipの中に「Rigidbodyを持つ揺れ物ボーン」向けの
+    /// クリップ診断：AnimationClipの中に「揺れ物ボーン」向けの
     /// カーブが入っていないかを検査する。
+    /// （揺れ物の定義は GLB の extras.mmd 由来。MmdEditorShared.TryCollectSwayBones を参照）
     ///
     /// 背景：本体のみベイクのGLTFでも、パイプラインが全ノードに
     /// レストポーズの定数キー（静的チャンネル）を付けることがある。
@@ -22,7 +23,7 @@ namespace Mmd2GltfImporter
     /// </summary>
     public class MmdClipCurveInspector : EditorWindow
     {
-        [MenuItem("MMD Physics/クリップ診断（揺れ物カーブ検査）")]
+        [MenuItem("MMD Physics/クリップ診断（揺れ物カーブ検査）", false, 20)]
         public static void ShowWindow()
         {
             GetWindow<MmdClipCurveInspector>("クリップ診断");
@@ -39,9 +40,10 @@ namespace Mmd2GltfImporter
         private void OnGUI()
         {
             EditorGUILayout.HelpBox(
-                "クリップの中に、Rigidbodyを持つ揺れ物ボーン（スカート・髪など）向けの\n" +
+                "クリップの中に、揺れ物ボーン（スカート・髪など）向けの\n" +
                 "カーブが入っていないかを検査します。定数キーでもAnimatorは毎フレーム\n" +
-                "書き戻すため、ライブ物理が描画前に上書きされます。",
+                "書き戻すため、ライブ物理が描画前に上書きされます。\n" +
+                "揺れ物は GLB の extras.mmd（物理演算剛体 mode≠0）から特定します。",
                 MessageType.Info);
 
             modelRoot = (GameObject)EditorGUILayout.ObjectField("モデル (Scene上)", modelRoot, typeof(GameObject), true);
@@ -66,20 +68,12 @@ namespace Mmd2GltfImporter
             }
         }
 
-        /// <summary>モデル配下の非Kinematic Rigidbodyが乗るボーンの相対パス集合を作る</summary>
-        private Dictionary<string, string> CollectSwayBonePaths()
+        /// <summary>揺れ物ボーンの相対パス集合を作る（GLBの extras.mmd 由来。定義は MmdEditorShared 参照）</summary>
+        private Dictionary<string, string> CollectSwayBonePaths(out string error)
         {
-            var result = new Dictionary<string, string>(); // path → 分類ラベル
-            foreach (var rb in modelRoot.GetComponentsInChildren<Rigidbody>())
-            {
-                if (rb.isKinematic) continue; // 体のボーン(アニメ追従)は対象外
-                string path = AnimationUtility.CalculateTransformPath(rb.transform, modelRoot.transform);
-                string label = rb.name.Contains("スカート") ? "スカート"
-                             : (rb.name.Contains("髪") || rb.name.Contains("前髪") || rb.name.Contains("もみあげ") || rb.name.Contains("モミアゲ")) ? "髪"
-                             : "その他揺れ物";
-                result[path] = label;
-            }
-            return result;
+            if (!MmdEditorShared.TryCollectSwayBones(modelRoot, out var bones, out error))
+                return new Dictionary<string, string>();
+            return MmdEditorShared.ToRelativePaths(bones, modelRoot.transform);
         }
 
         private static bool IsConstantCurve(AnimationCurve c)
@@ -93,7 +87,15 @@ namespace Mmd2GltfImporter
 
         private void Inspect()
         {
-            var swayPaths = CollectSwayBonePaths();
+            var swayPaths = CollectSwayBonePaths(out string collectError);
+            if (swayPaths.Count == 0)
+            {
+                // 揺れ物が1本も取れないまま「カーブ0本=無罪」と報告すると誤診になる。理由を出して止める。
+                lastReport = "★検査できません: 揺れ物ボーンを特定できませんでした。\n  " + collectError;
+                _swayPathsInClip.Clear();
+                Debug.LogWarning("[クリップ診断] " + collectError);
+                return;
+            }
             var bindings = AnimationUtility.GetCurveBindings(clip);
 
             _swayPathsInClip.Clear();
@@ -116,7 +118,7 @@ namespace Mmd2GltfImporter
 
             var sb = new StringBuilder();
             sb.AppendLine($"クリップ: {clip.name} ／ 総カーブ数: {bindings.Length}");
-            sb.AppendLine($"揺れ物ボーン（非Kinematic Rigidbody持ち）: {swayPaths.Count} 本");
+            sb.AppendLine($"揺れ物ボーン（extras.mmd の物理演算剛体 mode≠0 が紐づくボーン）: {swayPaths.Count} 本");
             sb.AppendLine();
             if (swayCurveCount == 0)
             {
