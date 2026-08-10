@@ -12,7 +12,8 @@ A Unity Editor extension that reads the MMD-specific data preserved in the `extr
 
 ### Physics
 
-Reads PMX rigid bodies and joints and drives them with a **custom Bullet-compatible physics engine** (`Assets/MMD_Scripts/MmdPhysics/`, bundled). One button wires everything up, and secondary animation (hair, skirts, ribbons) moves close to stock MMD.
+Reads PMX rigid bodies and joints and drives them with a **custom Bullet-compatible physics engine** (`Assets/MMD_Scripts/MmdPhysics/`, bundled). One button wires everything up and secondary animation (hair, skirts, ribbons) comes alive.
+Stock MMD behaviour is the target, but this is **not on par with it** (see "Known limitations").
 
 - Reproduces PMX rigid bodies, joints, and physics modes (bone-follow / dynamic / dynamic + bone position merge)
 - Pure C#; no native dependency (no BulletSharp etc.)
@@ -99,7 +100,12 @@ Fine-tuning of physics (timestep, penetration handling) lives on the `MmdPhysics
 
 Earlier versions drove secondary animation with Unity `Rigidbody` + `ConfigurableJoint` (PhysX) and exposed 49 tuning sliders (springs, damping, soft limits, per-part dials).
 
-Now that the custom Bullet-compatible engine matches stock MMD behaviour, **the PhysX path has been removed**.
+The custom Bullet-compatible engine now produces **noticeably closer-to-MMD behaviour than the PhysX
+path did in practice**, so **the PhysX path has been removed** to avoid maintaining two implementations.
+
+> This does not mean it matches stock MMD. Numerical fidelity has only ever been validated against a
+> single model (IA), those numbers predate recent fixes, and some aspects — such as jitter at rest —
+> are still **worse** than stock MMD (see "Known limitations").
 
 | | Old | Current |
 |---|---|---|
