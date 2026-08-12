@@ -55,12 +55,19 @@ namespace BulletPhysics
         // 接触用の UseSplitImpulse とは独立 (接触既定 false=Bullet2.75 準拠は不変)。既定 false=挙動不変。
         public bool UseJointSplitImpulse = false;
         // ステップ2(a-1): ジョイントの直線ロック行のみ warm-start (蓄積インパルスをサブステップ間で引継ぎ)。
-        // ★2026-08-09 既定ON化: factor 0.85 で VMD統計(中央/p90)がMMDへ接近・完全ロックIA改善・
-        //   12窓比が帯内・単鎖トルク3×改善・不変条件全PASSを満たしたため既定ON。A/B用にフラグは残す。
-        public bool UseJointWarmStart = true;
+        // 2026-08-09 に factor 0.85 で既定ON化した (VMD統計がMMDへ接近・12窓比が帯内・単鎖トルク3×改善)。
+        // ★2026-08-12 既定OFFへ戻した。Bullet 2.75 は非接触拘束を warm-start しない
+        //   (btSequentialImpulseConstraintSolver.cpp:788 で毎ステップ m_appliedImpulse=0)。
+        //   0.85 でもラチェットは残っており、前髪チェーンが自励振動する。臨界係数はモデル依存で、
+        //   中間値(0.70/0.50)は「どれかのモデルのピークを踏む」。5モデル実測で 0(=撤去) が唯一安全:
+        //   待機区間の騒がしい3本 J中央 モデルA -89% / モデルN -41% / モデルB -32% (全モデルで全体最良)。
+        //   代償はスカート平時傾き -0.46°(11.33→10.87, MMD 11.39)と髪×体貫入の1.1〜3.7倍増
+        //   (ただし貫入>0.5 のフレームは全モデル0件)。12窓比はむしろ改善 1.0972→1.0608。
+        //   A/B で旧既定に戻すときは両フラグを true にする (Joint.WarmStartFactor が 0.85 のまま残してある)。
+        public bool UseJointWarmStart = false;
         // ステップ2(a-2): 角度行も warm-start (同一性キー=軸+側 lo/hi、同一性が変わればキャッシュ破棄)。
-        // UseJointWarmStart と併用。既定ON(上記と同じ理由)。
-        public bool UseJointWarmStartAngular = true;
+        // UseJointWarmStart と併用。既定OFF(上記と同じ理由)。
+        public bool UseJointWarmStartAngular = false;
         public float SplitImpulsePenetrationThreshold = -0.02f; // Bullet 2.75 m_splitImpulsePenetrationThreshold
 
         // 求解順序: Bullet 2.75 solveSingleIteration は 1反復内で「ジョイント(NonContact)→接触→摩擦」の順に解き、
@@ -85,9 +92,12 @@ namespace BulletPhysics
         private static readonly System.Diagnostics.Stopwatch _psw = new();
         private static double Tick() { _psw.Stop(); double ms = _psw.Elapsed.TotalMilliseconds; _psw.Restart(); return ms; }
 
-        // 接触監査#5: Bullet は接触のwarm-startで蓄積インパルスに m_warmstartingFactor(0.85) を掛ける。
-        // 当エンジンは従来 1.0 (そのまま適用)。既定 1.0=ビット不変, 0.85=Bullet準拠。
-        public float ContactWarmStartFactor = 1.0f;
+        // 接触監査#5: Bullet は接触のwarm-startで蓄積インパルスに m_warmstartingFactor(0.85) を掛ける
+        // (btContactSolverInfo.h:79)。当エンジンは従来 1.0 (減衰なし=残留を捨てない) だった。
+        // ★2026-08-12 Bullet 準拠の 0.85 を既定化。モデルA 実測で髪の符号バイアス -2.74°→-0.52°
+        //   (負=MMDより動かなさすぎ)、スカート平時傾き・深貫入はほぼ不変。
+        //   ジョイント側 warm-start 撤去と併用したときの 12窓比は 1.0972→1.0608 で MMD へ接近する。
+        public float ContactWarmStartFactor = 0.85f;
 
         // 接触監査#1+2: Bullet は 1反復内で法線→摩擦の順(摩擦は同反復の法線インパルスで上限決定)。
         // 当エンジンは従来 摩擦→法線(摩擦は前反復の法線を使用)。ON で Bullet 同順(法線先)。既定 false=ビット不変。

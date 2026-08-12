@@ -112,8 +112,12 @@ namespace BulletPhysics
         private readonly bool[] _warmAngSeen = new bool[3];       // このサブステップで当該 DOF の角度 warm 行が出たか。
         // 診断: 角度 warm 行の総数と、同一性(側)が前サブステップから変わった行数。
         public static long WarmAngRows, WarmAngToggles;
-        // warm-start 引継ぎ係数 (Bullet m_warmstartingFactor 相当, 既定0.85)。過拘束系で
-        // 引継ぎインパルスがラチェット的に積み上がるのを抑える。1.0=減衰なし(積み上がりやすい)。
+        // warm-start 引継ぎ係数。過拘束系で引継ぎインパルスがラチェット的に積み上がるのを抑える。
+        // ★2026-08-12: ジョイントの warm-start 自体を既定OFFにしたので、この値は
+        //   PhysicsWorld.UseJointWarmStart(Angular) を true に戻したときだけ効く (A/B用)。
+        //   0.85 は Bullet の接触側 m_warmstartingFactor から借りた値で、旧既定の再現用に残してある。
+        //   ★この値でジョイントを warm-start してはいけない: 0.85 でもラチェット共振が残り、
+        //   臨界係数がモデル依存で動くため中間値はどれかのモデルで悪化する (PhysicsWorld.cs の注記参照)。
         public static float WarmStartFactor = 0.85f;
 
         // --- ファクトリ: PMX Joint 種から生成 ---
