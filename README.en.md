@@ -68,6 +68,38 @@ void OnTriggerEnter(Collider other) {
 - [lilToon](https://github.com/lilxyzw/lilToon) for material conversion (not needed if you only want physics)
 - A `.glb` produced by `mmd2gltf-gui`
 
+### You must import the `.glb` with UniGLTF
+
+Unity's standard glTF importer (**glTFast**, from the Package Manager) **does not work** here, and it
+fails **without any error or warning**. The symptom is hair and skirts swinging around to the front of
+the body.
+
+The cause is the axis conversion done at import time. `mmd2gltf` **flips Z** when converting PMX to
+glTF, and UniGLTF **flips Z again** when importing glTF into Unity. The two cancel out, so Unity bone
+coordinates end up equal to native PMX coordinates — which is exactly what this physics engine assumes
+(its coordinate bridge is identity apart from unit scale). glTFast **flips X** instead, so nothing
+cancels and the skeleton ends up rotated 180° about Y relative to PMX. Rigid bodies are still built
+from the raw PMX coordinates stored in `extras.mmd`, so the two no longer agree.
+
+**How to check** — select the `.glb` and read the Inspector header.
+
+| Header | Verdict |
+|---|---|
+| `<name> Import Settings (Glb Scripted Importer)` | UniGLTF. Correct |
+| `<name> Import Settings (Gltf Importer)`, etc. | A different importer. Will not work |
+
+**How to fix** — remove Unity's glTF importer from the Package Manager, install UniGLTF, reimport the
+`.glb` (if that does not take effect, delete the `.glb` and its `.meta` and add it again), then redo the
+physics wiring.
+
+Also note that UniGLTF's axis setting is a **per-machine** preference
+(`Edit > Preferences > UniGLTF > Default Invert axis`); it is not stored in the project. When a `.glb`
+has `Reverse Axis` set to `Default`, that machine-wide preference is what gets used. The default,
+**`Z`**, is the correct value. Check this when you start working on a different machine.
+
+> `MmdPhysicsBehaviour` checks for this mismatch on startup (`Check Import Convention`, on by default)
+> and logs an error with the cause and the fix.
+
 ---
 
 ## Setup

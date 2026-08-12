@@ -67,6 +67,34 @@ void OnTriggerEnter(Collider other) {
 - [lilToon](https://github.com/lilxyzw/lilToon)（マテリアル変換に使用。物理演算のみを使う場合は不要）
 - `mmd2gltf-gui` で変換した `.glb` ファイル
 
+### ★ `.glb` は必ず UniGLTF で取り込んでください
+
+Unity 標準の glTF インポーター（Package Manager の **glTFast**）で取り込むと**動きません**。しかも
+**エラーも警告も一切出ません**。症状は「髪やスカートが体の正面へ回り込む」です。
+
+理由は取り込み時の軸変換です。`mmd2gltf` は PMX→glTF で **Z を反転**し、UniGLTF は glTF→Unity で
+**再び Z を反転**します。この二重反転が相殺するので「Unity のボーン座標 = PMX ネイティブ座標」となり、
+物理エンジンはこれを前提に境界の座標変換を恒等（単位スケールのみ）にしています。
+glTFast は代わりに **X を反転**するため相殺が起きず、スケルトンだけが PMX に対して Y 軸 180° 回った
+状態になります。剛体は GLB の `extras.mmd` にある raw PMX 座標のまま構築されるため基準が食い違います。
+
+**確認方法** — `.glb` を選択して Inspector の見出しを見てください。
+
+| 見出し | 判定 |
+|---|---|
+| `<名前> Import Settings (Glb Scripted Importer)` | UniGLTF。正しい |
+| `<名前> Import Settings (Gltf Importer)` など | 別のインポーター。動きません |
+
+**直し方** — Package Manager から Unity の glTF インポーターを削除 → UniGLTF を導入 →
+`.glb` を Reimport（効かない場合は `.glb` と `.meta` を消して入れ直す）→ 物理の配線をやり直す。
+
+もう一点、UniGLTF の軸設定は **PC ごとの設定**（`Edit > Preferences > UniGLTF > Default Invert axis`）で、
+プロジェクトには保存されません。`.glb` の Inspector の `Reverse Axis` が `Default` のときはこの PC 設定が
+使われます。既定の **`Z`** が正しい値です。別の PC で作業を始めたときはここも確認してください。
+
+> この食い違いは `MmdPhysicsBehaviour` が起動時に自動検査します（`Check Import Convention`、既定 ON）。
+> 検出すると Console に原因と対処法つきの LogError を出します。
+
 ---
 
 ## セットアップ

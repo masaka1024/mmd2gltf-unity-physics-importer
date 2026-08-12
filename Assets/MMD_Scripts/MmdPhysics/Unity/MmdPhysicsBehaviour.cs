@@ -167,6 +167,19 @@ namespace BulletPhysics.Unity
             if (_diagLeft > 0 && _diagTr != null) _diagUpdatePos = _diagTr.position;
         }
 
+        [Header("Import Check (取り込み経路の検証)")]
+        // ★このエンジンは「Unityのボーン座標 = PMXネイティブ座標」を前提に、境界の座標変換を
+        //   単位スケールのみの恒等写像にしている(下の MmdToUnityPos 参照)。これが成立するのは
+        //   GLB を **UniGLTF** で取り込んだ場合だけである:
+        //     mmd2gltf が PMX→glTF で Z を反転し、UniGLTF が glTF→Unity で再度 Z を反転して相殺する。
+        //   Unity 標準の glTF インポーター(glTFast)は代わりに X を反転するため相殺が起きず、
+        //   スケルトンは PMX に対して Y軸180°回った状態で取り込まれる。剛体は extras.mmd の
+        //   raw PMX 座標のまま構築されるので基準が食い違い、髪やスカートが体の反対側(正面)へ出る。
+        // ★この食い違いは Unity も UniGLTF も一切エラーを出さない (2026-08-12 に実際に踏んだ)。
+        //   だから起動時に自前で突き合わせる。検出できれば原因究明は数分で済む。
+        [Tooltip("起動時にボーン配置とPMXバインド位置を突き合わせ、取り込み時の軸変換の食い違いを検出してLogErrorする")]
+        public bool CheckImportConvention = true;
+
         [Header("Debug")]
         // ★既定OFF (2026-08-10)。自作エンジンが既定の物理になり通常のシーンで常駐するため、
         //   剛体100個超のギズモを常時描くのはSceneビューのノイズと描画コストにしかならない。
@@ -216,6 +229,9 @@ namespace BulletPhysics.Unity
             _builder.World.UseJointSplitImpulse = JointSplitImpulse;
             _builder.World.EnableSleeping = EnableSleeping;
             ResolveBones();
+            // 剛体を動かす前に検査する。この時点のスケルトンはバインド姿勢
+            // (Animator がフレーム0を書くのは Start より後) なので PMX バインドと直接比較できる。
+            if (CheckImportConvention) CheckImportConventionCore(false);
             ResetPhysicsToBones();
             // アニメがフレーム0を適用するのは Start より後(Update→LateUpdate 間)。この時点の
             // リセットはバインド基準なので、LateUpdate で posed 姿勢へ再整合し直す予約を入れる。
@@ -276,6 +292,121 @@ namespace BulletPhysics.Unity
             for (int i = 0; i < _model.BoneNames.Count; i++)
                 if (map.TryGetValue(_model.BoneNames[i], out var tr))
                     _boneTransforms[i] = tr;
+        }
+
+        /// <summary>取り込み経路の検証。Inspector で右クリック → "Check import convention"。
+        /// Play 前(バインド姿勢)に実行するのが最も確実。</summary>
+        [ContextMenu("Check import convention")]
+        public void CheckImportConventionNow()
+        {
+            if (_model == null)
+            {
+                try
+                {
+                    if (Source == InputSource.Glb) { if (!string.IsNullOrEmpty(GlbPath)) _model = GlbPhysicsReader.LoadFile(GlbPath, out _, out _); }
+                    else if (!string.IsNullOrEmpty(PmxPath)) _model = PmxReader.LoadFile(PmxPath);
+                }
+                catch (System.Exception e) { Debug.LogWarning($"[取り込み検査] モデル読込失敗: {e.Message}"); }
+            }
+            if (_model != null && ModelRoot != null) ResolveBones();
+            CheckImportConventionCore(true);
+        }
+
+        // ボーンの配置を PMX バインド位置と突き合わせ、恒等以外の軸変換が挟まっていれば
+        // 原因と対処法つきで LogError する。判定はモデルのシーン配置に影響されない:
+        // ModelRoot のローカルへ落として並進・回転・スケールを除去し、さらに重心を引いてから比較する。
+        private void CheckImportConventionCore(bool verbose)
+        {
+            if (ModelRoot == null || _model == null || _boneTransforms == null)
+            {
+                if (verbose) Debug.LogWarning("[取り込み検査] 実行不可 (ModelRoot / モデル / ボーンのいずれかが未設定)。");
+                return;
+            }
+            int n = _model.BoneNames.Count;
+            if (_boneTransforms.Length < n) n = _boneTransforms.Length;
+            if (_model.BonePositions.Count < n) n = _model.BonePositions.Count;
+
+            var ux = new float[n]; var uy = new float[n]; var uz = new float[n];
+            var px = new float[n]; var py = new float[n]; var pz = new float[n];
+            int m = 0, unresolved = 0;
+            for (int i = 0; i < n; i++)
+            {
+                var tr = _boneTransforms[i];
+                if (tr == null) { unresolved++; continue; }
+                var l = ModelRoot.InverseTransformPoint(tr.position);
+                ux[m] = l.x / UnitScale; uy[m] = l.y / UnitScale; uz[m] = l.z / UnitScale;
+                var p = _model.BonePositions[i];
+                px[m] = p.x; py[m] = p.y; pz[m] = p.z;
+                m++;
+            }
+            if (m < 4)
+            {
+                Debug.LogError($"[取り込み検査] ボーンを {m}/{n} 本しか解決できません (未解決 {unresolved})。" +
+                    "ModelRoot がモデルのルートを指しているか、取り込み時にボーン名が変えられていないかを確認してください " +
+                    "(Unity 標準の glTF インポーターは重複するノード名にサフィックスを付けます)。");
+                return;
+            }
+
+            float cux = 0, cuy = 0, cuz = 0, cpx = 0, cpy = 0, cpz = 0;
+            for (int i = 0; i < m; i++) { cux += ux[i]; cuy += uy[i]; cuz += uz[i]; cpx += px[i]; cpy += py[i]; cpz += pz[i]; }
+            cux /= m; cuy /= m; cuz /= m; cpx /= m; cpy /= m; cpz /= m;
+
+            // 候補の軸変換それぞれで残差 RMS を測り、最も合うものを選ぶ。
+            //   一致    = mmd2gltf と UniGLTF の ReverseZ が相殺した期待どおりの状態
+            //   Y180    = 取り込み側が Z でなく X を反転した (Unity 標準の glTF インポーター等)
+            //   Z/X鏡映 = 掌性が反転している (境界に余分な符号反転が残っている)
+            string[] names = { "一致", "Y軸180度回転", "Z鏡映", "X鏡映" };
+            int[] sx = { 1, -1, 1, -1 };
+            int[] sz = { 1, -1, -1, 1 };
+            int best = 0; float bestRms = float.MaxValue, identityRms = 0f;
+            for (int c = 0; c < names.Length; c++)
+            {
+                double acc = 0;
+                for (int i = 0; i < m; i++)
+                {
+                    float dx = (ux[i] - cux) - sx[c] * (px[i] - cpx);
+                    float dy = (uy[i] - cuy) - (py[i] - cpy);
+                    float dz = (uz[i] - cuz) - sz[c] * (pz[i] - cpz);
+                    acc += dx * dx + dy * dy + dz * dz;
+                }
+                float rms = (float)System.Math.Sqrt(acc / m);
+                if (c == 0) identityRms = rms;
+                if (rms < bestRms) { bestRms = rms; best = c; }
+            }
+            // 許容量はモデルの広がりに対する相対値 (単位や体格に依存しないため)。
+            double sacc = 0;
+            for (int i = 0; i < m; i++)
+            { float dx = px[i] - cpx, dy = py[i] - cpy, dz = pz[i] - cpz; sacc += dx * dx + dy * dy + dz * dz; }
+            float spread = (float)System.Math.Sqrt(sacc / m);
+            float tol = 0.02f * (spread > 1e-3f ? spread : 1f);
+
+            string head = $"[取り込み検査] ボーン {m}/{n}" + (unresolved > 0 ? $" (未解決 {unresolved})" : "") +
+                $" 残差RMS: 一致={identityRms:F4} / 最良={names[best]}={bestRms:F4} / 許容={tol:F4} (PMX単位)";
+
+            if (best == 0)
+            {
+                if (identityRms <= tol)
+                {
+                    if (verbose) Debug.Log(head + " → OK。座標系は期待どおりです。");
+                }
+                else if (verbose)
+                {
+                    Debug.LogWarning(head + " → 軸変換は正しい(「一致」が最良)が残差が大きめです。" +
+                        "Play 中に実行するとアニメで姿勢が変わっているため大きく出ます。Play 前に実行してください。" +
+                        "Play 前でも大きい場合は UnitScale の不一致か、GLB とこのコンポーネントが参照するモデルが別物である可能性があります。");
+                }
+                return;
+            }
+
+            Debug.LogError(head + "\n" +
+                $"→ ★スケルトンが PMX に対して「{names[best]}」の状態で取り込まれています。" +
+                "剛体は GLB の extras.mmd にある raw PMX 座標のまま構築されるため基準が食い違い、" +
+                "髪やスカートが体の反対側(正面)へ出ます。\n" +
+                "原因はほぼ確実に GLB の取り込みに使ったインポーターです。.glb を選択して Inspector の見出しを見てください。\n" +
+                "  UniGLTF なら『<名前> Import Settings (Glb Scripted Importer)』と表示されます。" +
+                "『(Gltf Importer)』など他の名前なら、それが原因です。\n" +
+                "対処: Package Manager から Unity の glTF インポーターを削除 → UniGLTF (com.vrmc.gltf) を導入 → " +
+                ".glb を Reimport (効かない場合は .glb と .meta を消して入れ直す) → 物理の配線をやり直す。");
         }
 
         void FixedUpdate()
