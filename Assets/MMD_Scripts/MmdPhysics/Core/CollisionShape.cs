@@ -121,6 +121,15 @@ namespace BulletPhysics
 
         public override ShapeType Type => ShapeType.Capsule;
 
+        /// <summary>慣性計算で half-extent に足すマージン。Bullet 2.75 の CONVEX_DISTANCE_MARGIN。
+        /// ★2026-08-13: 0 → 0.04 (Bullet 準拠)。長らくこの1項が抜けており、
+        /// 「btCapsuleShape::calculateLocalInertia を忠実に再現」というコメントが実際には嘘だった。
+        /// 実測(モデルA): スカートは完全に無影響(箱剛体のため)、髪は静区間の角度差 中央 20.96→19.84 /
+        /// p90 81.30→73.07 (-10%) / 位置差 p90 1.601→1.425 と改善。深貫入は 0 件のまま。
+        /// 符号バイアスのみ -1.53°→-2.12° と微増(どちらも「動かなさすぎ」側)。
+        /// A/B 用に static のまま残す (env INERTIAMARGIN)。0 で従来値を再現できる。</summary>
+        public static float InertiaMargin = 0.04f;
+
         public float HalfHeight => Height * 0.5f;
 
         public override Vec3 LocalSupport(Vec3 dir)
@@ -141,10 +150,18 @@ namespace BulletPhysics
             // ※ 将来「正しい式」に直さないこと。円柱式は横軸慣性が半分以下になり、
             //   カプセル剛体(髪など)がMMDより過敏に回ってしまう。
             // upAxis は Y (PMX のカプセルは Y 軸方向)。halfExtents = (r,r,r) の Y に halfHeight を加算。
+            // ★2026-08-13: Bullet は各 half-extent に CONVEX_DISTANCE_MARGIN(0.04) を足してから
+            //   箱慣性を計算する (btCapsuleShape.cpp:136-140)。当エンジンはこの1項が抜けていた。
+            //   小さいカプセルほど効く: r=0.15/h=0.30 の前髪で慣性が 26〜38% 過小
+            //   (I_x 1.35倍 / I_y 1.60倍)、r=0.60/h=1.50 の髪では 7〜13% にとどまる。
+            //   慣性が小さい = 同じトルクでより速く回る = 駆動への過剰応答。
+            //   ※箱は Bullet も margin 込みの half-extents を使うので当エンジンと一致済み。ここだけの差。
+            //   既定 0 = 従来値 = ビット不変。0.04 で Bullet 準拠。
             var r = Radius;
-            var hx = r;
-            var hy = r + HalfHeight;
-            var hz = r;
+            var m = InertiaMargin;
+            var hx = r + m;
+            var hy = r + HalfHeight + m;
+            var hz = r + m;
             var lx = 2f * hx;
             var ly = 2f * hy;
             var lz = 2f * hz;
