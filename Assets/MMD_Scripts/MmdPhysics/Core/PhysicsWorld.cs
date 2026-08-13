@@ -37,7 +37,21 @@ namespace BulletPhysics
         // ※細刻み化は SubSteps で行う (FixedTimeStep を下げる経路はキネマティック補間の分母が
         //   フレーム総サブステップ数で正しく効く。両経路とも補間は修正済みだが、入力は 1/30 境界)。
         public int SolverIterations = 10;
-        public int SubSteps = 2;
+        // ★2026-08-13: 2 → 4 (実効 1/60 → 1/120)。貫入対策。
+        //   機構: 接触の検出帯は Collision.cs の SpeculativeMargin=0.02 という「速度を見ない固定距離」で、
+        //   駆動剛体は接触点で 1/30 あたり中央 0.114 (法線成分 0.052) 動く = 帯の 5.7倍。
+        //   接触が生成された時点で既に深く刺さっており、貫入オンセットの 58% は
+        //   「前フレームに接触点ゼロ」から始まっていた。刻みを半分にすると 1ステップの移動量が減り、
+        //   ソルバが押し出す機会も増えるので両方に効く。
+        //   実測(5モデル): 貫入中央 -45〜-63%、悪化したモデルは無し。深貫入>0.5 は IA で 5件→0件、
+        //   hairfid 7001フレームで 20件→0件。
+        //   ★忠実度も同時に改善する: 12窓比 中央 1.0608 → 0.9867 (過去最良)、
+        //   スカート p90 22.16 → 25.98 (MMD 25.66)。8 は行き過ぎ (傾き14.30/12窓比1.181)。
+        //   ※過去に「SubSteps=4 は 12窓比 1.288 で不採用」と記録したが、あれはジョイント
+        //   warm-start が ON の時の測定。warm-start はサブステップ間で蓄積を引き継ぐため
+        //   細刻みほど悪化していた。撤去後は細刻みが素直に効く (両対策が噛み合っている)。
+        //   コスト: 物理位相の計装合計 0.473 → 0.876 ms/step (約1.85倍, 30Hz予算の 4%→7%)。
+        public int SubSteps = 4;
         public float FixedTimeStep = 1f / 30f;
 
         public float PenetrationSlop = 0.005f;
@@ -530,7 +544,12 @@ namespace BulletPhysics
             if (_pairCount < 0 || _pairBuiltForCount != n) BuildCollisionPairs();
             if (_aabbScratch == null || _aabbScratch.Length < n) _aabbScratch = new Aabb[n];
             var aabbs = _aabbScratch;
-            for (int i = 0; i < n; i++) aabbs[i] = Bodies[i].ComputeAabb();
+            // 検出帯を既定より広げているときだけ AABB も同じだけ膨らませる。
+            // 広げないと「形状は帯の中なのに AABB 段階で捨てられる」ため帯の拡大が効かない。
+            // 既定 (SpeculativeMargin=0.02) では extra=0 なので従来と完全に同一 = ビット不変。
+            float extra = GjkEpa.SpeculativeMargin - GjkEpa.SpeculativeMarginDefault;
+            if (extra > 0f) for (int i = 0; i < n; i++) { aabbs[i] = Bodies[i].ComputeAabb(); aabbs[i].Expand(extra); }
+            else for (int i = 0; i < n; i++) aabbs[i] = Bodies[i].ComputeAabb();
 
             var seen = _seenScratch; seen.Clear();
             for (int p = 0; p < _pairCount; p++)

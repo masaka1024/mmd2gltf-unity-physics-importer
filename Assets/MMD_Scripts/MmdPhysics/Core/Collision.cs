@@ -122,7 +122,22 @@ namespace BulletPhysics
         // 投機的接触マージン。表面が触れる少し手前から接触を生成して連続化し、
         // 貫入 on/off の振動 (Baumgarte のエネルギー注入) を防ぐ。Bullet の
         // collision margin と同じ役割。形状の Radius マージンとは別物 (二重計上しない)。
-        private const float SpeculativeMargin = 0.02f;
+        // ★2026-08-13: A/B 用に const → static field 化。既定 0.02 は従来値なのでビット不変。
+        //   貫入調査で判明: この帯は「速度を見ない固定距離」で、駆動剛体は接触点で 1/60 あたり
+        //   法線方向へ中央 0.026 動く = 中央値ですら 1ステップで帯を越える。その結果、貫入の 58% は
+        //   「前フレームに接触点ゼロ」から始まり、生成時点で既に深い。
+        // ★★測定結果: 帯を広げても貫入は直らない (2026-08-13, モデルA 1200フレーム, SubSteps=2)。
+        //   0.02 → 0.15 で「帯を飛び越えた割合」は 58.3% → 7.8% と狙いどおり激減するのに、
+        //   貫入中央は 0.0786 → 0.0812 で**まったく動かない**。0.08 では深貫入>0.5 が 5→20件と悪化。
+        //   = 律速は「検出が遅い」ことではなく「1ステップで押し出しきれない」ことだった。
+        //   → 速度依存マージン (Bullet 2.8x / Box2D の speculative contact) は**不採用**。
+        //   効いたのは刻みを細かくする方 (SubSteps 2→4 で貫入中央 -45%)。dt が小さいほど
+        //   Baumgarte の補正速度 (factor*pen/dt) が大きくなり、押し出し回数も増えるため。
+        //   このつまみは負の結果の再現用に残す。既定 0.02 から動かさないこと。
+        //   ※広げるときは PhysicsWorld のブロードフェーズ AABB も同じだけ広げないと、
+        //     ペアが AABB 段階で捨てられて効かない (PhysicsWorld.BroadphaseNarrowphase 参照)。
+        public static float SpeculativeMargin = 0.02f;
+        public const float SpeculativeMarginDefault = 0.02f;
 
         // カプセル軸がほぼ平行とみなす閾値 (sin^2θ)。
         // cross(dA,dB)^2 = |dA|^2|dB|^2 sin^2θ なので、正規化した外積長^2 と比較する。

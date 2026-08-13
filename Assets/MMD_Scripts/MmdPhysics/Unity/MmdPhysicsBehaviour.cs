@@ -44,8 +44,11 @@ namespace BulletPhysics.Unity
         //   毎FixedUpdateでちょうど1ステップ進み、更新間隔が等間隔になる(髪/スカートのコマ落ちが消える)。
         //   従来の 1/30 では 1FixedUpdate あたりの内部ステップが 0,1,0,1,1,... と変動し
         //   実時間の更新間隔が 20ms/40ms とバラついていた。詳細は DESIGN.md「コマ落ち(ジャダー)」節。
-        //   より忠実にしたい場合は SubSteps を 2 (=実効1/120) に。
-        public int SubSteps = 1;
+        // ★2026-08-13: SubSteps を 1 → 2 (実効 1/60 → 1/120)。貫入対策で、忠実度も同時に改善する。
+        //   理由と実測は PhysicsWorld.SubSteps の注記を参照 (あちらは 1/30×4 で同じ実効刻み)。
+        //   ★FixedTimeStep は 1/60 のまま触らないこと。ここを下げると Time.fixedDeltaTime との
+        //   整列 (下の AlignUnityFixedTimestep) が崩れ、コマ落ち(ジャダー)が戻る。細刻み化は SubSteps で行う。
+        public int SubSteps = 2;
         public float FixedTimeStep = 1f / 60f;
 
         [Header("Smoothness (コマ落ち/ジャダー対策)")]
