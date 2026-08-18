@@ -102,6 +102,25 @@ namespace BulletPhysics.Unity
         [Tooltip("起動直後にアニメのフレーム0姿勢へ物理を再整合する遅延フレーム数。バインド→フレーム0の瞬間移動による貫入(突き抜け)対策。0で無効。")]
         public int PoseResetDelayFrames = 2;
 
+        // アニメがループ/巻き戻し/シークすると、最終フレーム→先頭でポーズが不連続に飛ぶ。
+        // その差分がそのまま駆動剛体(BoneFollow)の速度になり、体のコライダーが高速で
+        // 揺れ物を薙ぎ払う (UE5移植版の実測: 左腕が1フレームで31.6cm移動 → しっぽが一過性で3.25倍)。
+        // 駆動ボーンの目標が1フレームでこの距離以上飛んだら、起動時と同じ再整合をやり直す。
+        // ★必ず起動時と同じ経路 (PoseResetDelayFrames のカウンタを張り直す) を通すこと。
+        //   「その場で1回 reset して、そのフレームの物理を捨てる」実装は悪化すると実測済み。
+        // 単位は PMX ネイティブ (1 ≒ 8cm)。既定 3 = 24cm/フレーム。
+        // ★この距離だけでは足りない: 速いダンスの手首は単独で 24.3cm/フレーム 動く実測がある。
+        //   同時に飛んだ本数の条件 (TeleportResetMinFraction) と必ず併用すること。0 で無効。
+        [Tooltip("駆動ボーンが1フレームでこの距離(PMX単位, 3≒24cm)以上飛んだらテレポートとみなし、起動時と同じ再整合をやり直す。アニメのループ境界対策。0で無効。")]
+        public float TeleportResetThreshold = 3f;
+
+        // ★1本だけ飛ぶのは速い腕/手首であってテレポートではない。骨格ごと飛んだときだけ
+        //   再整合したいので、駆動ボーンのうちこの割合以上が同時に飛んだことを条件にする。
+        //   実測 (モデルM・7001フレームのダンスを2周): ループ境界は 24本中10本が同時に飛ぶ (最大48cm)。
+        //   一方、ダンス中の 右手首 単独の 24.3cm は 24本中1本 → 距離だけの判定では誤検出していた。
+        [Tooltip("テレポートと判定するのに必要な「同時に飛んだ駆動ボーン」の割合。1本だけ速い腕/手首を誤検出しないための条件。")]
+        [Range(0f, 1f)] public float TeleportResetMinFraction = 0.25f;
+
         // ★PMX mode2 (物理演算+ボーン位置合わせ) の実装 (2026-08-10)。
         //   mode2 剛体は「位置はボーン階層から、回転は物理から」がMMDの仕様。従来これが未実装で
         //   mode1 と同じ完全自由になっていたため、スカートがMMDより柔らかかった
@@ -466,6 +485,27 @@ namespace BulletPhysics.Unity
 
             if (_builder == null) return;
 
+            // アニメのループ境界/巻き戻し/シークで骨格が飛んだら、起動時の再整合を張り直す。
+            // (判定は再整合そのものより前に置く。飛んだフレームの物理を捨てるのではなく、
+            //  起動時と同じ「数フレームかけて整合させる」経路へ載せる。)
+            if (_startupResetCountdown <= 0 && TeleportResetThreshold > 0f)
+            {
+                float th2 = TeleportResetThreshold * TeleportResetThreshold;
+                int over = 0, total = 0;
+                foreach (var link in _builder.BoneLinks)
+                {
+                    if (link.Mode != PhysicsMode.BoneFollow || link.BoneIndex < 0) continue;
+                    var bw = BoneWorldOrNull(link.BoneIndex);
+                    if (!bw.HasValue) continue;
+                    total++;
+                    var d = (bw.Value * link.BodyOffsetFromBone).Origin - link.Body.KinematicTarget.Origin;
+                    if (d.LengthSquared > th2) over++;
+                }
+                int need = System.Math.Max(1, (int)System.Math.Ceiling(total * TeleportResetMinFraction));
+                if (over >= need && over > 0)
+                    _startupResetCountdown = PoseResetDelayFrames > 0 ? PoseResetDelayFrames : 1;
+            }
+
             // 起動直後: アニメがフレーム0を適用した後の posed 骨格へ物理を再整合する。
             if (_startupResetCountdown > 0)
             {
@@ -502,7 +542,7 @@ namespace BulletPhysics.Unity
             //     旋回時に遠心力を担う並進速度まで消えて髪が軸へ collapse した (Tda式で振幅1.16→2.19、
             //     最小半径2.73→1.70)。シミュレーションには触れないのが正しい。
             bool needAligned = AlignBonePositions || (EnableBoneMergeMode && _builder.HasBoneMergeBodies);
-            RigidTransform?[] aligned = needAligned ? _builder.ComputeAlignedBonePoses(BoneWorldOrNull, AlignRotClampAlpha) : null;
+            RigidTransform?[] aligned = needAligned ? _builder.ComputeAlignedBonePoses(BoneWorldOrNull, AlignRotClampAlpha, AlignBonePositions) : null;
             foreach (var link in _builder.BoneLinks)
             {
                 if (link.Mode == PhysicsMode.BoneFollow) continue;

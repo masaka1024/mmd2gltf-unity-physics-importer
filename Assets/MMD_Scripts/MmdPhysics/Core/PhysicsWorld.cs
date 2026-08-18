@@ -37,6 +37,30 @@ namespace BulletPhysics
         // ※細刻み化は SubSteps で行う (FixedTimeStep を下げる経路はキネマティック補間の分母が
         //   フレーム総サブステップ数で正しく効く。両経路とも補間は修正済みだが、入力は 1/30 境界)。
         public int SolverIterations = 10;
+
+        // 速度求解でジョイントだけを追加で回す回数。0 = SolverIterations と同じ (従来の挙動・ビット不変)。
+        //
+        // ★長い鎖のたわみを抑えるための値。Gauss-Seidel は 1 反復あたりジョイント 1 本ぶんしか
+        //   情報を伝えないので、反復数より節数が多い鎖ではアンカー側の拘束が末端まで届かない。
+        //   届かなかったぶんの相対速度が位置誤差として残る。
+        // ★接触と分けてある理由: 接触の反復を増やすと待機区間の揺れが悪化する (UE5移植版の実測)。
+        //   鎖に要るのはジョイントの伝播だけなので、接触は SolverIterations のまま据え置く。
+        //   衝突検出とばねはサブステップに1回きりで、ここで増えるのは行の解き直しだけ。
+        // ★JointVelocityIterations <= SolverIterations のときは従来と完全に同じ順序・同じ回数。
+        // 由来: UE5移植版 (mmd2gltf-ue5-physics-importer c2202a5) からの逆輸入。あちらでは
+        //   13節のしっぽが単調に伸び続ける破綻の主対策で、40 を再生時の既定にしている。
+        //   ★当エンジンでは同じ破綻は再現しない (SubSteps=2 の実効 1/120 では鎖の最大比 3.2倍止まりで、
+        //     窓ごとの推移も単調でない = ラチェットではなくたわみ)。実効 1/30 まで粗くすると
+        //     しっぽ３ が 5.19 倍まで開き、あちらの症状に近づく。詳細は tools/chainstab。
+        public int JointVelocityIterations = 0;
+
+        // ジョイントの位置補正(Baumgarte)速度の上限。0 = Joint.MaxCorrectionVel を触らない (=従来の 10)。
+        // ★JointVelocityIterations と対で使う。片方だけでは効かない (UE5移植版の実測):
+        //   反復だけ増やす=破綻を遅らせるだけ / 上限だけ上げる=速度が収束していない状態で補正を
+        //   強めるので悪化する。上限は「発散を止められる範囲で一番弱い値」を選ぶ (低すぎても高すぎても壊れる)。
+        // ※Joint.MaxCorrectionVel は A/B 用の static なので、StepSimulation で写している。
+        public float JointMaxCorrectionVel = 0f;
+
         // ★2026-08-13: 2 → 4 (実効 1/60 → 1/120)。貫入対策。
         //   機構: 接触の検出帯は Collision.cs の SpeculativeMargin=0.02 という「速度を見ない固定距離」で、
         //   駆動剛体は接触点で 1/30 あたり中央 0.114 (法線成分 0.052) 動く = 帯の 5.7倍。
@@ -152,6 +176,10 @@ namespace BulletPhysics
         // --- 公開ステップ (可変 dt を固定ステップに分割) ---
         public void StepSimulation(float deltaTime)
         {
+            // Joint.MaxCorrectionVel は A/B 用の static なので、ワールド側の設定をここで写す。
+            // 0 のときは触らない (= 従来の既定 10 のまま = ビット不変)。
+            if (JointMaxCorrectionVel > 0f) Joint.MaxCorrectionVel = JointMaxCorrectionVel;
+
             _accumulator += deltaTime;
 
             // このフレームで走らせる内部ステップ数を先に確定する。
@@ -213,22 +241,27 @@ namespace BulletPhysics
             WarmStart();
             if (ProfileEnabled) ProfWarm += Tick();
 
-            for (int it = 0; it < SolverIterations; it++)
+            // ★ジョイントは接触より多く回せる (JointVelocityIterations)。既定 0 なら回数も順序も従来どおり。
+            int jointIters = JointVelocityIterations > 0 ? JointVelocityIterations : SolverIterations;
+            int totalIters = System.Math.Max(SolverIterations, jointIters);
+            for (int it = 0; it < totalIters; it++)
             {
+                bool doContacts = it < SolverIterations;
+                bool doJoints = it < jointIters;
                 if (SolveJointsFirst)
                 {
                     // Bullet 2.75 同順: ジョイント → 接触 (接触が後勝ち)。
-                    foreach (var j in Joints) j.SolveVelocity();
+                    if (doJoints) foreach (var j in Joints) j.SolveVelocity();
                     if (ProfileEnabled) ProfSolveJoint += Tick();
-                    SolveContacts();
+                    if (doContacts) SolveContacts();
                     if (ProfileEnabled) ProfSolveContact += Tick();
                 }
                 else
                 {
                     // 従来順: 接触 → ジョイント (ジョイントが後勝ち)。
-                    SolveContacts();
+                    if (doContacts) SolveContacts();
                     if (ProfileEnabled) ProfSolveContact += Tick();
-                    foreach (var j in Joints) j.SolveVelocity();
+                    if (doJoints) foreach (var j in Joints) j.SolveVelocity();
                     if (ProfileEnabled) ProfSolveJoint += Tick();
                 }
             }
@@ -242,6 +275,9 @@ namespace BulletPhysics
                     Bodies[i].PseudoLinearVelocity = Vec3.Zero;
                     Bodies[i].PseudoAngularVelocity = Vec3.Zero;
                 }
+                // ★位置補正側の反復は SolverIterations のまま据え置くこと。ここでジョイントだけ
+                //   JointVelocityIterations 回に増やすと悪化する (UE5移植版の実測。鎖の破綻は
+                //   「補正が足りない」より「補正が暴れる」側にある)。
                 for (int it = 0; it < SolverIterations; it++)
                 {
                     if (UseSplitImpulse) SolveSplitImpulse();

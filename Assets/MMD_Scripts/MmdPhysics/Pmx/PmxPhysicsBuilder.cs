@@ -195,17 +195,29 @@ namespace BulletPhysics.Pmx
         ///   [Jointロック内部演算] 再現の第一形: 親側ジョイントの相対euler(補正済親フレーム基準)を
         ///   リミット超過分だけ α で戻す。MMD(補正ON)の超過8-14°は完全clampでないことを示すため中間αを掃引する。</param>
         /// 順序比較(位置を物理回転で再構成→回転のみclamp)は、呼び出し側で α=0 と α>0 の2回呼びを合成する。
+        /// <param name="alignAllPositions">true=物理ボーンの位置を一律で親チェーンから再構成する(従来の挙動)。
+        ///   false(既定)=mode1 のボーンは剛体の生の姿勢を返す。書き戻し側 (PullPhysicsToBones) が
+        ///   mode1 を生位置で書くため、ここで作り直すと「画面に出る親」と「mode2 の子が基準にした親」が
+        ///   食い違う。呼び出し側の AlignBonePositions をそのまま渡すこと。</param>
         public RigidTransform?[] ComputeAlignedBonePoses(System.Func<int, RigidTransform?> getDrivenBoneWorld,
-            float rotClampAlpha = 0f)
+            float rotClampAlpha = 0f, bool alignAllPositions = false)
         {
             int n = _model.BoneNames.Count;
             var physRot = new Quat?[n]; // 物理ボーンの復元回転 (位置は捨てる)
             var linkOf = new System.Collections.Generic.Dictionary<RigidBody, BoneLink>();
+            // ボーンindex -> BoneLink。mode1 と mode2 で位置の出どころが違うので Align 側で要る。
+            var linkOfBone = new BoneLink?[n];
             foreach (var link in BoneLinks)
             {
                 if (link.Body != null) linkOf[link.Body] = link;
                 if (link.BoneIndex >= 0 && link.BoneIndex < n && link.Mode != PhysicsMode.BoneFollow)
+                {
                     physRot[link.BoneIndex] = (link.Body.WorldTransform * link.BodyOffsetFromBone.Inverse()).Rotation;
+                    // ★同じボーンに複数の剛体が付くことがある (例: 腰パーツ親_1/_2/_3)。
+                    //   最後に見つけたものが残る。physRot も直上で同じように上書きしているので、
+                    //   回転と位置が別の剛体から来ることはない。
+                    linkOfBone[link.BoneIndex] = link;
+                }
             }
             // 物理ボーン -> 親側ジョイント (BodyB=自分の剛体)。clamp 用。
             System.Collections.Generic.Dictionary<int, Joint> parentJoint = null;
@@ -254,6 +266,21 @@ namespace BulletPhysics.Pmx
                 }
                 else
                 {
+                    // ★mode1 (物理演算) のボーンは、書き戻し側が**剛体の生の姿勢をそのまま書く**。
+                    //   ここで bind 長の鎖を作り直すと、画面に出る親と、mode2 の子が基準にした親が
+                    //   別物になり、鎖の最後の1節だけが伸び縮みする
+                    //   (実測: しっぽ１〜１２=mode1 の先の しっぽ１３=mode2 が静止状態で 0.20 倍)。
+                    //   MMD の [物理演算+Bone位置合わせ] は「親ボーンの**実際の**現在姿勢」を基準にするので、
+                    //   親として返すのも生の姿勢でなければならない。
+                    //   alignAllPositions が立っているときだけ、鎖全体を一貫して再構成する。
+                    var myLink = linkOfBone[i];
+                    if (!alignAllPositions && myLink.HasValue && myLink.Value.Body != null &&
+                        myLink.Value.Mode != PhysicsMode.DynamicBoneMerge)
+                    {
+                        world[i] = myLink.Value.Body.WorldTransform * myLink.Value.BodyOffsetFromBone.Inverse();
+                        return world[i].Value;
+                    }
+
                     // 物理: 回転 = 物理 (rotClampAlpha>0 なら親側ジョイントのリミットへ α で戻す)。
                     //        位置 = 親(補正済)から再構成。親無しはバインド位置。
                     var rot = physRot[i].Value;
