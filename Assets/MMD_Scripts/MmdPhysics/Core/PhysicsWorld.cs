@@ -1,4 +1,4 @@
-// ===========================================================================
+﻿// ===========================================================================
 // Unity Bullet 互換物理エンジン – PhysicsWorld
 // btDiscreteDynamicsWorld 相当。重力・積分・衝突・Joint を統合する。
 // Sequential-Impulse ソルバ + Baumgarte 位置補正。
@@ -22,6 +22,7 @@ namespace BulletPhysics
         public float NormalImpulse, TangentImpulse1, TangentImpulse2;
         public float PushImpulse;      // Split Impulse の蓄積擬似インパルス (ウォームスタートしない)
         public PersistentManifold Manifold; public int PointRef; // ウォームスタート書き戻し用
+        public bool UseTangent2;   // 摩擦を2方向使うか (Bullet 既定は1方向)
     }
 
     /// <summary>物理ワールド。剛体と Joint を保持しシミュレートする。</summary>
@@ -79,6 +80,24 @@ namespace BulletPhysics
         public float FixedTimeStep = 1f / 30f;
 
         public float PenetrationSlop = 0.005f;
+        // ★2026-08-20: 一度 0 にしたが **駆動系で致命的に悪化したため 0.2 へ差し戻した**。
+        //   Bullet 2.75 btContactSolverInfo::m_erp = 0.2 と同値 (Bullet忠実)。
+        //
+        //   0 にした理由 (静止のみで判断していた):
+        //     駆動なし(バインド姿勢)で揺れ物が止まらない主因が接触の位置補正
+        //     biasVel = BaumgarteFactor * pen / dt が実速度に載ることだと実測。
+        //     31モデルの静止スイープで悪化ゼロ・改善多数だった
+        //     (Tda式V4X 342.9->1.07 / ゆかりver7 181.2->6.96 / 貫入も同時に減少)。
+        //
+        //   ★却下の決め手 (hairfid, IA + 駆動CSV 7001F, 深貫入>0.5 のイベント数):
+        //     BaumgarteFactor=0.2 -> **0件** (最大貫入 0.000)
+        //     BaumgarteFactor=0   -> **1992件** (最大貫入 1.144, うち静区間1824)
+        //     MMD自身(幾何・同分母) = 66件
+        //     髪FLB3 が 下半身4 に沈んだまま110フレーム連続で抜けない。
+        //   静止では「押し込む力が無い」ので貫入が浅く見えていただけで、
+        //   駆動中はキネマティック剛体が動的剛体を押し込む。押し戻す手段を丸ごと外すと戻れない。
+        //   ★教訓: **接触まわりの変更を静止だけで判断しない。必ず hairfid で駆動系を通す。**
+        //     (BAUM env を hairfid に追加済み。BAUM=0.2 で変更前を再現できる)
         public float BaumgarteFactor = 0.2f;
         public float RestitutionThreshold = 1.0f;
 
@@ -140,6 +159,31 @@ namespace BulletPhysics
         // 接触監査#1+2: Bullet は 1反復内で法線→摩擦の順(摩擦は同反復の法線インパルスで上限決定)。
         // 当エンジンは従来 摩擦→法線(摩擦は前反復の法線を使用)。ON で Bullet 同順(法線先)。既定 false=ビット不変。
         public bool ContactNormalBeforeFriction = false;
+
+        // ═══ タスク30: 接触ソルバの Bullet 2.75 整合セット (2026-08-22) ═══
+        //  8/09 の接触監査で挙がった4逸脱を A/B フラグにした。**すべて既定 false = ビット不変。**
+        //  背景: モデルB のスカートの残留振動は 100% 接触由来で、同一姿勢からの接触**生成**は
+        //  Bullet と6桁一致する (タスク28 段(a))。にもかかわらず 1サブステップ解いただけで
+        //  速度が中央 0.37 も違う → 差は **求解側** にある。
+
+        /// <summary>(1) 反復内の順序を Bullet と同じ「法線プール全部 → 摩擦プール全部」にする。
+        /// 当エンジンの既定は接触ごとに (摩擦→法線) を回す。<see cref="ContactNormalBeforeFriction"/> は
+        /// 接触ごとの順序を入れ替えるだけで、**プール単位ではない**。
+        /// Bullet: solveGroupCacheFriendlyIterations で contactPool を全部解いてから frictionPool を全部解く。
+        /// これを立てると (2) 摩擦上限が「同反復の法線インパルス」になる効果も自動的に付く。</summary>
+        public bool ContactPoolOrder = false;
+
+        /// <summary>(3) 摩擦方向を Bullet 既定に合わせる: **1方向のみ**、接線相対速度に整列。
+        /// Bullet 2.75 の既定 solverMode は `SOLVER_USE_WARMSTARTING | SOLVER_SIMD` で
+        /// **SOLVER_USE_2_FRICTION_DIRECTIONS が立っていない** ため摩擦は1本。
+        /// 方向は convertContact で `vel - n*(n·vel)` を正規化したもの (接線速度が実質ゼロなら
+        /// btPlaneSpace1 の任意基底)。当エンジンは常に直交2方向を張る。</summary>
+        public bool FrictionVelocityAligned = false;
+
+        /// <summary>(4) 摩擦係数の合成を Bullet と同じ **積** にする。
+        /// Bullet: `btManifoldResult::calculateCombinedFriction` = `f0 * f1`。
+        /// 当エンジン: `sqrt(f0 * f1)`。例: 0.8 と 0.5 なら Bullet 0.40 / 当エンジン 0.632。</summary>
+        public bool FrictionCombineMultiply = false;
 
         public readonly List<RigidBody> Bodies = new();
         public readonly List<Joint> Joints = new();
@@ -233,6 +277,8 @@ namespace BulletPhysics
             BuildContactConstraints(dt);
             if (ProfileEnabled) { ProfBuild += Tick(); ProfContacts += _contacts.Count; ProfSubSteps++; }
 
+            // ばねのモーター行 (Bullet の velFactor = fps*damping/numIterations) に反復回数が要る。
+            Joint.SolverIterationsForSpring = SolverIterations;
             foreach (var j in Joints) j.Prepare(dt, UseJointSplitImpulse, UseJointWarmStart, UseJointWarmStartAngular);
             if (ProfileEnabled) ProfPrepare += Tick();
             foreach (var j in Joints) j.ApplySprings(dt);
@@ -268,7 +314,7 @@ namespace BulletPhysics
 
             // Split Impulse: 実速度の求解後、貫入回復(接触)/位置補正(ジョイント)を擬似速度側で
             // 別反復して解く。擬似速度を 0 から解き、位置積分にのみ反映する (実速度には残さない)。
-            if (UseSplitImpulse || UseJointSplitImpulse)
+            if (UseSplitImpulse || UseJointSplitImpulse || Joint.SplitCrossOnly || Joint.SplitChainOnly)
             {
                 for (int i = 0; i < Bodies.Count; i++)
                 {
@@ -281,7 +327,7 @@ namespace BulletPhysics
                 for (int it = 0; it < SolverIterations; it++)
                 {
                     if (UseSplitImpulse) SolveSplitImpulse();
-                    if (UseJointSplitImpulse) foreach (var j in Joints) j.SolveSplitPosition();
+                    if (UseJointSplitImpulse || Joint.SplitCrossOnly || Joint.SplitChainOnly) foreach (var j in Joints) j.SolveSplitPosition();
                 }
             }
 
@@ -465,6 +511,15 @@ namespace BulletPhysics
             return (float)Math.Pow(1f - d, dt);
         }
 
+        /// <summary>★タスク34: 姿勢積分を Bullet 2.75 の実経路 (指数写像) にする。
+        /// 既定 false は従来の線形化更新 (q += 0.5*w*q*dt) でビット不変。
+        /// Bullet の btTransformUtil::integrateTransform は QUATERNION_DERIVATIVE を
+        /// #ifdef で切っており、走るのは指数写像のほう。</summary>
+        public static bool BulletRotationIntegration = false;
+
+        /// <summary>Bullet ANGULAR_MOTION_THRESHOLD = 0.5 * SIMD_HALF_PI。</summary>
+        private const float AngularMotionThreshold = 0.5f * (float)(Math.PI * 0.5);
+
         // --- 位置積分 ---
         private void IntegratePositions(float dt)
         {
@@ -494,14 +549,31 @@ namespace BulletPhysics
                 }
                 t.Origin += vlin * dt;
 
-                // クォータニオン積分: q += 0.5 * w * q * dt。
+                // クォータニオン積分。
+                //  既定 (false): q += 0.5 * w * q * dt。これは Bullet 2.75 btTransformUtil.h の
+                //    QUATERNION_DERIVATIVE 分岐と同じ式だが、**Bullet 側では #ifdef で無効**であり
+                //    実際に走るのは下の指数写像。角度 θ=|w|dt に対し θ^3/24 の系統誤差が毎ステップ乗る。
+                //  true: Bullet 2.75 の実経路 (指数写像 + ANGULAR_MOTION_THRESHOLD クランプ) を移植。
                 var w = vang;
-                var spin = new Quat(w.x, w.y, w.z, 0f) * t.Rotation;
-                t.Rotation = new Quat(
-                    t.Rotation.x + spin.x * 0.5f * dt,
-                    t.Rotation.y + spin.y * 0.5f * dt,
-                    t.Rotation.z + spin.z * 0.5f * dt,
-                    t.Rotation.w + spin.w * 0.5f * dt).Normalized;
+                if (BulletRotationIntegration)
+                {
+                    float fAngle = (float)Math.Sqrt(w.x * w.x + w.y * w.y + w.z * w.z);
+                    if (fAngle * dt > AngularMotionThreshold) fAngle = AngularMotionThreshold / dt;
+                    float sc = fAngle < 0.001f
+                        ? 0.5f * dt - (dt * dt * dt) * 0.020833333333f * fAngle * fAngle
+                        : (float)Math.Sin(0.5f * fAngle * dt) / fAngle;
+                    var dorn = new Quat(w.x * sc, w.y * sc, w.z * sc, (float)Math.Cos(fAngle * dt * 0.5f));
+                    t.Rotation = (dorn * t.Rotation).Normalized;
+                }
+                else
+                {
+                    var spin = new Quat(w.x, w.y, w.z, 0f) * t.Rotation;
+                    t.Rotation = new Quat(
+                        t.Rotation.x + spin.x * 0.5f * dt,
+                        t.Rotation.y + spin.y * 0.5f * dt,
+                        t.Rotation.z + spin.z * 0.5f * dt,
+                        t.Rotation.w + spin.w * 0.5f * dt).Normalized;
+                }
 
                 b.WorldTransform = t;
                 b.UpdateInertiaWorld();
@@ -665,19 +737,31 @@ namespace BulletPhysics
 
                     // 接線基底。
                     BuildTangentBasis(n, out var t1, out var t2);
+                    bool useT2 = true;
+                    if (FrictionVelocityAligned)
+                    {
+                        // Bullet convertContact: dir1 = 正規化(vel - n*(n·vel))。接線速度が無ければ任意基底。
+                        var vrel = b.VelocityAtPoint(cp.PositionWorldB) - a.VelocityAtPoint(cp.PositionWorldA);
+                        var lat = vrel - n * vrel.Dot(n);
+                        float l2 = lat.LengthSquared;
+                        if (l2 > 1e-12f) { t1 = lat / (float)Math.Sqrt(l2); t2 = Vec3.Cross(t1, n); }
+                        useT2 = false;   // Bullet 既定は摩擦1方向
+                    }
 
                     var cc = new ContactConstraint
                     {
                         A = a, B = b, RelA = rA, RelB = rB,
                         Normal = n, Tangent1 = t1, Tangent2 = t2,
-                        Friction = (float)Math.Sqrt(Math.Max(0, a.Friction) * Math.Max(0, b.Friction)),
+                        Friction = FrictionCombineMultiply
+                                 ? Math.Max(0, a.Friction) * Math.Max(0, b.Friction)          // Bullet: 積
+                                 : (float)Math.Sqrt(Math.Max(0, a.Friction) * Math.Max(0, b.Friction)),
                         NormalMass = EffectiveMass(a, b, rA, rB, n),
                         TangentMass1 = EffectiveMass(a, b, rA, rB, t1),
                         TangentMass2 = EffectiveMass(a, b, rA, rB, t2),
                         NormalImpulse = cp.NormalImpulse,
                         TangentImpulse1 = cp.TangentImpulse1,
                         TangentImpulse2 = cp.TangentImpulse2,
-                        Manifold = m, PointRef = p,
+                        Manifold = m, PointRef = p, UseTangent2 = useT2,
                     };
 
                     // 法線の目標接近速度 (NormalBias) を決める。
@@ -712,6 +796,9 @@ namespace BulletPhysics
                         float speculative = -cp.Distance / dt;
                         cc.NormalBias = Math.Min(speculative, restBias);
                     }
+                    DebugContactRows?.Add((a.Name, b.Name, cp.PositionWorldA, cp.PositionWorldB, n,
+                        cp.Distance, cc.NormalBias, cc.PushBias, cc.Friction, cc.NormalMass,
+                        cp.NormalImpulse, cp.TangentImpulse1, cp.TangentImpulse2));
                     _contacts.Add(cc);
                 }
             }
@@ -740,6 +827,15 @@ namespace BulletPhysics
         // 検証用の読み取り専用診断フック。null (既定) の間は何もせず、挙動・性能に影響しない。
         // 回帰テスト (非貫入押し出しの検出など) が接触の Distance/法線インパルスを参照するために使う。
         public System.Collections.Generic.List<(string a, string b, float dist, float ni)> DebugContacts;
+
+        /// <summary>検証用の読み取り専用診断フック (既定 null = 何もしない・ビット不変)。
+        /// タスク28 (接触編の行レベル突き合わせ): 接触制約を**構築した直後**に、その接触点の
+        /// 生成情報と行の係数を記録する。Bullet 2.75 の manifold / btSolverConstraint と
+        /// 同じ土俵で「点数・位置・法線・深さ・bias・摩擦・実効質量・warm引き継ぎ量」を並べるため。
+        /// `DebugContacts` と同じ流儀。</summary>
+        public System.Collections.Generic.List<(string a, string b, Vec3 pA, Vec3 pB, Vec3 n,
+            float dist, float normalBias, float pushBias, float friction,
+            float normalMass, float warmNormal, float warmT1, float warmT2)> DebugContactRows;
 
         // 蓄積インパルスを manifold へ書き戻し、次フレームのウォームスタートに使う。
         private void StoreImpulses()
@@ -777,6 +873,26 @@ namespace BulletPhysics
         // --- 接触速度求解 ---
         private void SolveContacts()
         {
+            if (ContactPoolOrder)
+            {
+                // Bullet 同型: 法線プールを全部解いてから摩擦プールを全部解く。
+                // 摩擦の上限は「同反復で解いた法線インパルス」になる (Bullet と同じ)。
+                for (int i = 0; i < _contacts.Count; i++)
+                {
+                    var c = _contacts[i];
+                    SolveNormal(ref c, c.A, c.B);
+                    _contacts[i] = c;
+                }
+                for (int i = 0; i < _contacts.Count; i++)
+                {
+                    var c = _contacts[i];
+                    SolveFriction(ref c, c.A, c.B, c.Tangent1, c.TangentMass1, ref c.TangentImpulse1);
+                    if (c.UseTangent2)
+                        SolveFriction(ref c, c.A, c.B, c.Tangent2, c.TangentMass2, ref c.TangentImpulse2);
+                    _contacts[i] = c;
+                }
+                return;
+            }
             for (int i = 0; i < _contacts.Count; i++)
             {
                 var c = _contacts[i];
@@ -786,7 +902,7 @@ namespace BulletPhysics
                 {
                     // 従来: 摩擦(前反復の法線で上限) → 法線。
                     SolveFriction(ref c, a, b, c.Tangent1, c.TangentMass1, ref c.TangentImpulse1);
-                    SolveFriction(ref c, a, b, c.Tangent2, c.TangentMass2, ref c.TangentImpulse2);
+                    if (c.UseTangent2) SolveFriction(ref c, a, b, c.Tangent2, c.TangentMass2, ref c.TangentImpulse2);
                     SolveNormal(ref c, a, b);
                 }
                 else
@@ -794,7 +910,7 @@ namespace BulletPhysics
                     // Bullet同順: 法線 → 摩擦(同反復の法線で上限)。
                     SolveNormal(ref c, a, b);
                     SolveFriction(ref c, a, b, c.Tangent1, c.TangentMass1, ref c.TangentImpulse1);
-                    SolveFriction(ref c, a, b, c.Tangent2, c.TangentMass2, ref c.TangentImpulse2);
+                    if (c.UseTangent2) SolveFriction(ref c, a, b, c.Tangent2, c.TangentMass2, ref c.TangentImpulse2);
                 }
 
                 _contacts[i] = c;
