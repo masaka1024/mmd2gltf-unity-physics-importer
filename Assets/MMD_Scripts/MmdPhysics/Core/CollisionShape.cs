@@ -25,6 +25,25 @@ namespace BulletPhysics
         /// <summary>衝突マージン。Bullet 既定に合わせ既定値を持つ。</summary>
         public float Margin = 0.04f;
 
+        /// <summary>Bullet 2.75 `CONVEX_DISTANCE_MARGIN` (btCollisionMargin.h:21)。
+        /// btConvexInternalShape の既定マージンで、箱もカプセルもこの値を使う。つまみにしない。</summary>
+        public const float BulletConvexDistanceMargin = 0.04f;
+
+        /// <summary>★タスク38: 形状マージンを Bullet 2.75 と同じ取り方にする (既定 false = ビット不変)。
+        /// **形状の構築時に読む**ので、PmxPhysicsBuilder.Build より前に立てること。
+        ///
+        ///   箱     : 当方 `min(半幅)*0.04` / Bullet 2.75 は **0.04 固定**。
+        ///            2.75 に `setSafeMargin` は**存在しない** (後年の Bullet で追加されたもの)。
+        ///            btBoxShape.h:87 `m_implicitShapeDimensions = halfExtents - margin` のみ。
+        ///            半幅 0.2 のスカート箱で 0.008 vs 0.04 = **5倍の差**。
+        ///            ※2.75 は半幅 &lt; 0.04 の箱でコアが負になるが (2.75 のバグ)、
+        ///              退化形状を作らないためここでは半幅未満へクランプする。
+        ///   カプセル: 当方 `Margin = 半径` (コア = 線分) / Bullet は `0.04` でコアを
+        ///            線分 + (半径 - 0.04) にする (btCapsuleShape.cpp:58 `vec*radius - vec*margin`)。
+        ///            **外形はどちらも 線分+半径 で一致**する。差が出るのは
+        ///            getMargin() を使う量 (GJK の探索距離・AABB・受理閾値) だけ。</summary>
+        public static bool BulletShapeMargin = false;
+
         /// <summary>ローカル座標系での support point (方向 dir で最も遠い点)。</summary>
         public abstract Vec3 LocalSupport(Vec3 dir);
 
@@ -73,7 +92,10 @@ namespace BulletPhysics
         public BoxShape(Vec3 halfExtents)
         {
             HalfExtents = halfExtents;
-            Margin = Math.Min(Math.Min(halfExtents.x, halfExtents.y), halfExtents.z) * 0.04f;
+            float minHalf = Math.Min(Math.Min(halfExtents.x, halfExtents.y), halfExtents.z);
+            Margin = BulletShapeMargin
+                ? Math.Min(BulletConvexDistanceMargin, minHalf * 0.999f)   // 2.75 は 0.04 固定 (クランプは退化よけ)
+                : minHalf * 0.04f;
         }
 
         public override ShapeType Type => ShapeType.Box;
@@ -116,7 +138,9 @@ namespace BulletPhysics
         {
             Radius = radius;
             Height = height;
-            Margin = radius;
+            // 当方はコア=線分なので Margin=半径。Bullet 2.75 はコアを線分+(半径-0.04) にして Margin=0.04。
+            // どちらも外形は 線分+半径 で同じ。
+            Margin = BulletShapeMargin ? Math.Min(BulletConvexDistanceMargin, radius) : radius;
         }
 
         public override ShapeType Type => ShapeType.Capsule;
@@ -134,10 +158,17 @@ namespace BulletPhysics
 
         public override Vec3 LocalSupport(Vec3 dir)
         {
-            // 線分の端点 (半径はマージンで付与)。
-            return dir.y >= 0
-                ? new Vec3(0, HalfHeight, 0)
-                : new Vec3(0, -HalfHeight, 0);
+            // 線分の端点。半径のうち Margin ぶんは LocalSupportWithMargin が足すので、
+            // ここでは (半径 - Margin) だけ膨らませる。
+            // 既定は Margin == Radius なので膨らみゼロ = 従来と完全に同一 (ビット不変)。
+            // BulletShapeMargin=true では Margin=0.04 になり、Bullet 2.75 の
+            // btCapsuleShape.cpp:58 `pos + vec*radius - vec*margin` と同じ形になる。
+            var seg = dir.y >= 0 ? new Vec3(0, HalfHeight, 0) : new Vec3(0, -HalfHeight, 0);
+            float core = Radius - Margin;
+            if (core <= 0f) return seg;
+            var len2 = dir.LengthSquared;
+            if (len2 < 1e-12f) return seg;
+            return seg + dir * (core / (float)Math.Sqrt(len2));
         }
 
         public override Vec3 CalculateLocalInertia(float mass)

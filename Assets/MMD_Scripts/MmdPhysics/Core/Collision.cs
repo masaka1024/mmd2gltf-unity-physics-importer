@@ -19,6 +19,13 @@ namespace BulletPhysics
         public Vec3 Normal;           // B から A へ向かう単位法線
         public float Distance;        // 負値 = 貫入量
 
+        /// <summary>★タスク68: このフレームのナローフェーズが「この点はまだ在る」と
+        /// 確認したか。Refresh の頭で false に落とし、AddPoint が
+        /// (既存に一致して置換 / 新規に追加) したときだけ true になる。
+        /// 幻の定義そのもの (= 新点で確認されなかった古い点) を表すので、
+        /// 深い側の破棄をこのフラグが false の点だけに限定できる。</summary>
+        public bool ConfirmedThisStep;
+
         // ソルバ用の蓄積インパルス (ウォームスタート)。
         public float NormalImpulse;
         public float TangentImpulse1;
@@ -34,8 +41,176 @@ namespace BulletPhysics
 
         public PersistentManifold(RigidBody a, RigidBody b) { BodyA = a; BodyB = b; }
 
+        /// <summary>タスク51: 接触点の管理 (同一判定・4点超過時の置換・破棄) を
+        /// Bullet 2.75 btPersistentManifold の実ソースへ揃える (既定 false = ビット不変)。
+        ///
+        /// 実測 (スカート網・60秒・両側 SubSteps=2) で支持面の育ち方が決定的に違った:
+        ///   59秒の点数分布  自前 1点=8 / 2点=10 / 3点=2 / 4点=1   総点数 38
+        ///                   Bullet 1点=7 / 2点=0 / 3点=2 / 4点=14  総点数 69
+        ///   per-frame の変位比は 60秒通して 32倍 のまま平行
+        ///   (Bullet は1秒で収束、当エンジンは一度も落ちない)。
+        /// 支持面が育たない・安定しないので、スカートが載り切らずに揺れ続けていた。
+        ///
+        /// 揃える規則は3つ。**部品化しない** (Bullet 側で一体の仕組みなので):
+        ///   1. 同一判定  getCacheEntry   : LocalPointA の距離が閾値の2乗未満なら同じ点として置換。
+        ///                従来は PositionWorldA の距離 0.02 固定で、広すぎて点が育たなかった。
+        ///   2. 4点超過時 sortCachedPoints: 4通りの組の面積 (外積長の2乗) を計算して最大を残す。
+        ///                加えて KEEP_DEEPEST_POINT で最深点は置換候補から外す。
+        ///                従来は「最も浅い点を置換」だけで支持が偏っていた。
+        ///   3. 破棄      refreshContactPoints: 法線距離 > 閾値、または法線へ射影した残差の
+        ///                長さの2乗 > 閾値の2乗 で破棄。従来は 0.04 固定で横ずれの取り方も別式。
+        /// 閾値は形状サイズ比例の接触破棄閾値を使う。当てる値は作らない。</summary>
+        public static bool BulletManifoldPoints = true;   // ★完全セットv1 で既定ON (2026-08-23)
+
+        /// <summary>診断カウンタ (タスク54)。ON の間だけ数える。数えるだけなのでビット不変。
+        /// warm-start が切れる箇所が Refresh の破棄か 同一判定の不成立かを分けるために足した。</summary>
+        public static bool CollectManifoldStats = false;
+        public static long StatRefreshKept, StatRefreshDropNormal, StatRefreshDropLateral, StatRefreshDropDeep;
+        public static long StatAddMatched, StatAddNewSlot, StatAddReplaced;
+        public static void ResetManifoldStats()
+        {
+            StatRefreshKept = StatRefreshDropNormal = StatRefreshDropLateral = StatRefreshDropDeep = 0;
+            StatAddMatched = StatAddNewSlot = StatAddReplaced = 0;
+        }
+
+        /// <summary>このペアの接触破棄閾値。Bullet の getContactBreakingThreshold() 相当。</summary>
+        private float BreakingThreshold =>
+            Math.Min(GjkEpa.BulletBreakingThresholdOf(BodyA.Shape),
+                     GjkEpa.BulletBreakingThresholdOf(BodyB.Shape));
+
+        /// <summary>★タスク67: validContactDistance を **深い側にも対称に**適用する
+        /// (既定 false = ビット不変)。閾値は既存の contactBreakingThreshold をそのまま使い、
+        /// 新しいパラメータは足さない。
+        ///
+        /// ★これは Bullet に無い機構である。2.75 も現行 3.x master も
+        ///   `validContactDistance(pt) { return pt.m_distance1 <= getContactBreakingThreshold(); }`
+        ///   の**片側**判定のままで、深い側の番人はどこにも無い
+        ///   (bulletphysics/bullet3 master btPersistentManifold.h / .cpp を 2026-08-23 に確認)。
+        ///   したがって北極星 原則2 の「登録済み逸脱 + 出力ゲート判定」の手続きで扱う。
+        ///
+        /// なぜ要るか (タスク65/66 の実測):
+        ///   剛体が回ると、保存済みローカル点は真の最近接から滑る。
+        ///   `d = (worldA - worldB)·normal` は法線が凍結したまま **負へ暴走**し、
+        ///   実測で真値「接触なし」のペアが d = -0.66 まで育った。
+        ///   片側判定は正の側しか見ず、横ずれ判定は法線方向のドリフトを捕まえないので、
+        ///   この点は誰にも殺されない。しかも新しく生成された正しい点は
+        ///   getCacheEntry の一致閾値 (0.0354) に対し pA が 0.50〜1.10 も離れているため
+        ///   **別スロットに入るだけで幻を置換できない**。
+        ///   幻の d はそのまま接触 rhs に載る: NormalBias = -d*erp/dt = 0.2*0.66*60 = 7.9。
+        ///   定常窓の接触行の 14% (22/154) がこの幻だった。
+        ///
+        /// ★タスク68 で **鮮度条件つき** に限定した。破棄の対象は
+        ///   「そのフレームのナローフェーズに確認されなかった点」だけ (ContactPoint.ConfirmedThisStep)。
+        ///   タスク67 の無条件版は正当に深い接触まで毎フレーム捨てて warm-start を切ってしまい、
+        ///   スカート (接触点の **61%** が閾値 0.0109 より深い) を 0.73x -> 0.17x と過減衰させた。
+        ///   鮮度条件を入れると、毎フレーム作り直される本物の深い接触は無傷のまま
+        ///   滑って取り残された幻だけを殺せる。</summary>
+        public static bool SymmetricBreakingDistance = true;   // ★完全セットv1 で既定ON (2026-08-23)
+
+        // btPersistentManifold::refreshContactPoints の移植。
+        private void RefreshBullet()
+        {
+            float thr = BreakingThreshold;
+            float thr2 = thr * thr;
+            for (int i = Points.Count - 1; i >= 0; i--)
+            {
+                var cp = Points[i];
+                var worldA = BodyA.WorldTransform.TransformPoint(cp.LocalPointA);
+                var worldB = BodyB.WorldTransform.TransformPoint(cp.LocalPointB);
+                float d = (worldA - worldB).Dot(cp.Normal);
+                cp.PositionWorldA = worldA;
+                cp.PositionWorldB = worldB;
+                cp.Distance = d;
+                // validContactDistance: 法線方向に閾値を超えて離れたら破棄。
+                if (d > thr) { if (CollectManifoldStats) StatRefreshDropNormal++; Points.RemoveAt(i); continue; }
+                // 法線成分を除いた残差 (Bullet と同じ射影の取り方) が閾値の2乗を超えたら破棄。
+                var projected = worldA - cp.Normal * d;
+                var diff2 = worldB - projected;
+                if (diff2.LengthSquared > thr2) { if (CollectManifoldStats) StatRefreshDropLateral++; Points.RemoveAt(i); continue; }
+                if (CollectManifoldStats) StatRefreshKept++;
+                cp.ConfirmedThisStep = false;   // ★タスク68: 今フレームの確認はまだ無い
+                Points[i] = cp;
+            }
+        }
+
+        /// <summary>★タスク68: 深い側の破棄。**Refresh → Detect → AddPoint のあとに** 呼ぶ。
+        /// このフレームのナローフェーズに確認されなかった点だけを対象にするので、
+        /// 毎フレーム作り直される正当な深い接触 (スカートは接触点の61%が閾値より深い) は無傷。
+        /// 閾値は既存の contactBreakingThreshold をそのまま流用する。</summary>
+        public void PruneStaleDeep()
+        {
+            if (!SymmetricBreakingDistance) return;
+            float thr = BulletManifoldPoints ? BreakingThreshold : 0.04f;
+            for (int i = Points.Count - 1; i >= 0; i--)
+            {
+                var cp = Points[i];
+                if (cp.ConfirmedThisStep || cp.Distance >= -thr) continue;
+                if (CollectManifoldStats) StatRefreshDropDeep++;
+                Points.RemoveAt(i);
+            }
+        }
+
+        // btPersistentManifold の addManifoldPoint / getCacheEntry の移植。
+        private void AddPointBullet(ContactPoint cp)
+        {
+            float shortest = BreakingThreshold * BreakingThreshold;
+            int near = -1;
+            for (int i = 0; i < Points.Count; i++)
+            {
+                float d2 = (Points[i].LocalPointA - cp.LocalPointA).LengthSquared;
+                if (d2 < shortest) { shortest = d2; near = i; }
+            }
+            cp.ConfirmedThisStep = true;   // ★タスク68: 今フレームのナローフェーズ由来
+            if (near >= 0)
+            {
+                if (CollectManifoldStats) StatAddMatched++;
+                cp.NormalImpulse = Points[near].NormalImpulse;
+                cp.TangentImpulse1 = Points[near].TangentImpulse1;
+                cp.TangentImpulse2 = Points[near].TangentImpulse2;
+                Points[near] = cp;
+                return;
+            }
+            if (Points.Count < 4) { if (CollectManifoldStats) StatAddNewSlot++; Points.Add(cp); return; }
+            if (CollectManifoldStats) StatAddReplaced++;
+            Points[SortCachedPoints(cp)] = cp;
+        }
+
+        // btPersistentManifold::sortCachedPoints の移植。置換すべき index を返す。
+        //   4通りの「新点を入れて i を捨てた組」の面積 (外積長の2乗) を出し、最大の組を選ぶ。
+        //   KEEP_DEEPEST_POINT: 最深点はその case の面積を 0 のままにして候補から外す。
+        private int SortCachedPoints(ContactPoint pt)
+        {
+            int maxPenetrationIndex = -1;
+            float maxPenetration = pt.Distance;
+            for (int i = 0; i < 4; i++)
+                if (Points[i].Distance < maxPenetration)
+                { maxPenetrationIndex = i; maxPenetration = Points[i].Distance; }
+
+            float res0 = 0f, res1 = 0f, res2 = 0f, res3 = 0f;
+            if (maxPenetrationIndex != 0)
+                res0 = Vec3.Cross(pt.LocalPointA - Points[1].LocalPointA,
+                                  Points[3].LocalPointA - Points[2].LocalPointA).LengthSquared;
+            if (maxPenetrationIndex != 1)
+                res1 = Vec3.Cross(pt.LocalPointA - Points[0].LocalPointA,
+                                  Points[3].LocalPointA - Points[2].LocalPointA).LengthSquared;
+            if (maxPenetrationIndex != 2)
+                res2 = Vec3.Cross(pt.LocalPointA - Points[0].LocalPointA,
+                                  Points[3].LocalPointA - Points[1].LocalPointA).LengthSquared;
+            if (maxPenetrationIndex != 3)
+                res3 = Vec3.Cross(pt.LocalPointA - Points[0].LocalPointA,
+                                  Points[2].LocalPointA - Points[1].LocalPointA).LengthSquared;
+
+            // btVector4::closestAxis4 = 最大成分の index。
+            int best = 0; float bv = res0;
+            if (res1 > bv) { bv = res1; best = 1; }
+            if (res2 > bv) { bv = res2; best = 2; }
+            if (res3 > bv) { bv = res3; best = 3; }
+            return best;
+        }
+
         public void Refresh()
         {
+            if (BulletManifoldPoints) { RefreshBullet(); return; }
             // 各接触点をローカル座標から現在姿勢でワールドへ再投影し、
             // 法線方向に離れた/横ずれした点を破棄する。生存点は位置を更新。
             for (int i = Points.Count - 1; i >= 0; i--)
@@ -48,25 +223,32 @@ namespace BulletPhysics
                 var lateral = diff - cp.Normal * d;
                 if (d > 0.04f || lateral.LengthSquared > 0.04f * 0.04f)
                 {
+                    if (CollectManifoldStats)
+                    { if (d > 0.04f) StatRefreshDropNormal++; else StatRefreshDropLateral++; }
                     Points.RemoveAt(i);
                     continue;
                 }
+                if (CollectManifoldStats) StatRefreshKept++;
                 // 生存: 再投影した位置と貫入量をソルバへ渡すため更新。
                 cp.PositionWorldA = worldA;
                 cp.PositionWorldB = worldB;
                 cp.Distance = d;
+                cp.ConfirmedThisStep = false;   // ★タスク68
                 Points[i] = cp;
             }
         }
 
         public void AddPoint(ContactPoint cp)
         {
+            if (BulletManifoldPoints) { AddPointBullet(cp); return; }
+            cp.ConfirmedThisStep = true;   // ★タスク68
             // 近い既存点があればウォームスタート値を引き継いで置換。
             const float mergeDist2 = 0.02f * 0.02f;
             for (int i = 0; i < Points.Count; i++)
             {
                 if ((Points[i].PositionWorldA - cp.PositionWorldA).LengthSquared < mergeDist2)
                 {
+                    if (CollectManifoldStats) StatAddMatched++;
                     cp.NormalImpulse = Points[i].NormalImpulse;
                     cp.TangentImpulse1 = Points[i].TangentImpulse1;
                     cp.TangentImpulse2 = Points[i].TangentImpulse2;
@@ -74,8 +256,8 @@ namespace BulletPhysics
                     return;
                 }
             }
-            if (Points.Count < 4) Points.Add(cp);
-            else Points[WorstPointIndex(cp)] = cp;
+            if (Points.Count < 4) { if (CollectManifoldStats) StatAddNewSlot++; Points.Add(cp); }
+            else { if (CollectManifoldStats) StatAddReplaced++; Points[WorstPointIndex(cp)] = cp; }
         }
 
         private int WorstPointIndex(ContactPoint candidate)
@@ -139,6 +321,52 @@ namespace BulletPhysics
         public static float SpeculativeMargin = 0.02f;
         public const float SpeculativeMarginDefault = 0.02f;
 
+        // ★タスク38: 接触の受理閾値を Bullet 2.75 の方式へ (既定 false = ビット不変)。
+        //   当エンジン: 全ペア一律 SpeculativeMargin = 0.02 の**固定距離**。
+        //   Bullet 2.75: ペアごとに **形状サイズ比例**。
+        //     btCollisionDispatcher.cpp:84
+        //       threshold = min(shapeA->getContactBreakingThreshold(), shapeB->...)
+        //     btCollisionShape.cpp:48
+        //       getContactBreakingThreshold() = getAngularMotionDisc() * gContactThresholdFactor
+        //       gContactThresholdFactor = 0.02 (btCollisionShape.cpp:18)
+        //     btCollisionShape.cpp:52
+        //       getAngularMotionDisc() = disc + |center|
+        //       (getBoundingSphere は**単位変換**の getAabb から
+        //        disc = |max-min|*0.5 / center = (min+max)*0.5 を作る)
+        //   PMX の3形状はどれもローカル原点対称なので center = 0、disc = ローカルAABBの半対角。
+        //   実測の差: 半幅(0.347,0.371,0.200)のスカート箱で Bullet 0.0109 に対し当方 0.02。
+        //   **当方が約2倍広く拾っている** = 分離しているペアまで接触に上げている。
+        public static bool BulletContactThreshold = true;   // ★完全セットv1 で既定ON (2026-08-23)
+
+        /// <summary>Bullet 2.75 gContactThresholdFactor。つまみにしない (実ソースの値)。</summary>
+        public const float ContactThresholdFactor = 0.02f;
+
+        // このペアで使う受理閾値。Detect の冒頭で毎回決める。
+        //   エンジンは単一スレッドで回す前提 (PhysicsWorld のループは逐次)。
+        private static float _pairThreshold = SpeculativeMarginDefault;
+
+        /// <summary>Bullet 2.75 btCollisionShape::getContactBreakingThreshold() 相当。
+        /// ローカル AABB は **Bullet の getAabb と同じ取り方** をする:
+        ///   球     : (r,r,r)                    … margin = r なので実質そのまま
+        ///   箱     : HalfExtents                … getHalfExtentsWithMargin() と一致
+        ///   カプセル: (r,hh+r,r) + margin(0.04) … btCapsuleShape::getAabb が margin を足すため</summary>
+        /// <summary>ペアの片側ぶんの接触破棄閾値。PersistentManifold からも使う。</summary>
+        internal static float BulletBreakingThresholdOf(CollisionShape s) => BulletBreakingThreshold(s);
+
+        private static float BulletBreakingThreshold(CollisionShape s)
+        {
+            Vec3 h;
+            if (s is SphereShape sp) h = new Vec3(sp.Radius, sp.Radius, sp.Radius);
+            else if (s is BoxShape bx) h = bx.HalfExtents;
+            else if (s is CapsuleShape cp)
+            {
+                float m = CollisionShape.BulletConvexDistanceMargin;   // 0.04
+                h = new Vec3(cp.Radius + m, cp.HalfHeight + cp.Radius + m, cp.Radius + m);
+            }
+            else { float r = s.BoundingRadius; h = new Vec3(r, r, r); }
+            return h.Length * ContactThresholdFactor;   // disc(=|h|) * 0.02、center=0
+        }
+
         // カプセル軸がほぼ平行とみなす閾値 (sin^2θ)。
         // cross(dA,dB)^2 = |dA|^2|dB|^2 sin^2θ なので、正規化した外積長^2 と比較する。
         // 1e-3 は sinθ≈0.0316 (≈1.8°)。スカート等の面接触が数度以内で平行判定されるよう
@@ -152,6 +380,11 @@ namespace BulletPhysics
         /// </summary>
         public static void Detect(RigidBody a, RigidBody b, List<ContactPoint> outPoints)
         {
+            // ★このペアの受理閾値を先に決める (タスク38)。既定は従来どおり固定 0.02。
+            _pairThreshold = BulletContactThreshold
+                ? Math.Min(BulletBreakingThreshold(a.Shape), BulletBreakingThreshold(b.Shape))
+                : SpeculativeMargin;
+
             var ta = a.Shape.Type;
             var tb = b.Shape.Type;
 
@@ -204,7 +437,7 @@ namespace BulletPhysics
             var cB = b.WorldTransform.Origin; float rB = ((SphereShape)b.Shape).Radius;
             var dab = cB - cA; float rsum = rA + rB;
             float dist2 = dab.LengthSquared;
-            float rlim = rsum + SpeculativeMargin;
+            float rlim = rsum + _pairThreshold;
             if (dist2 >= rlim * rlim) return;
 
             float dist = (float)Math.Sqrt(dist2);
@@ -223,7 +456,7 @@ namespace BulletPhysics
             var cc = ClosestPtPointSegment(sc, q0, q1);
             var d = cc - sc; float rsum = sr + cr;
             float dist = d.Length;
-            if (dist >= rsum + SpeculativeMargin) return;
+            if (dist >= rsum + _pairThreshold) return;
 
             var nSphereToCap = dist > ContactEps ? d / dist : Vec3.YAxis;
             float sep = dist - rsum;
@@ -271,7 +504,7 @@ namespace BulletPhysics
             // 単一最近点。
             ClosestPtSegmentSegment(a0, a1, b0, b1, out _, out _, out var c1, out var c2);
             var d = c2 - c1; float dist = d.Length;
-            if (dist >= rsum + SpeculativeMargin) return;
+            if (dist >= rsum + _pairThreshold) return;
             Vec3 n = dist > ContactEps ? d / dist : PerpVector(dA); // A→B、縮退は軸垂直
             float sep = dist - rsum;
             Emit(a, b, outPoints, n, sep, c1 + n * rA, c2 - n * rB);
@@ -284,7 +517,7 @@ namespace BulletPhysics
             var cA = a0 + dAn * param;
             var cB = ClosestPtPointSegment(cA, b0, b1);
             var d = cB - cA; float dist = d.Length;
-            if (dist >= rsum + SpeculativeMargin) return;
+            if (dist >= rsum + _pairThreshold) return;
             var n = dist > ContactEps ? d / dist : PerpVector(dAn);
             float sep = dist - rsum;
             Emit(a, b, outPoints, n, sep, cA + n * rA, cB - n * rB);
@@ -292,7 +525,7 @@ namespace BulletPhysics
 
         // 球中心(箱ローカル座標 local)・箱半サイズ he・実効半径 r から、
         // 「箱→球」ローカル法線・分離(sep<0 で貫入)・箱表面点(ローカル)を解く。
-        // 非接触(SpeculativeMargin 超過)なら false。SphereBox / CapsuleBox の共通コア。
+        // 非接触(受理閾値 _pairThreshold 超過)なら false。SphereBox / CapsuleBox の共通コア。
         private static bool SolveSphereBoxLocal(Vec3 local, Vec3 he, float r,
             out Vec3 nLocalBoxToSphere, out float sep, out Vec3 boxSurfLocal)
         {
@@ -306,7 +539,7 @@ namespace BulletPhysics
                     Math.Clamp(local.y, -he.y, he.y),
                     Math.Clamp(local.z, -he.z, he.z));
                 var dl = local - q; float dist = dl.Length;
-                if (dist >= r + SpeculativeMargin)
+                if (dist >= r + _pairThreshold)
                 {
                     nLocalBoxToSphere = Vec3.YAxis; sep = 0f; boxSurfLocal = q;
                     return false;

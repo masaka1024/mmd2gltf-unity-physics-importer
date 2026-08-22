@@ -154,7 +154,7 @@ namespace BulletPhysics
         // 自前既定は A基底の直交列(_axesA)。8/07に一度試して破棄したが、当時は
         // (1)軸と誤差の対応順序が未確認のままで実装誤りの可能性 (2)判定相手が補正ON版のみ。
         // 補正OFF版(純Bullet)を相手に再評価するため復活。既定 false=従来(ビット不変)。
-        public static bool AngularMixedAxes = false;
+        public static bool AngularMixedAxes = true;   // ★完全セットv1 で既定ON (2026-08-23)
 
         /// <summary>A/B (既定 false = ビット不変): 角度の抽出規約を **Bullet 2.75 の実挙動** に合わせる。
         /// 2026-08-22 のタスク21 で、同一姿勢に対する相対角が 15 DOF すべて食い違うことが判明した。
@@ -176,7 +176,7 @@ namespace BulletPhysics
         ///       相対速度を (wB-wA)·axis で測る当エンジンの行と符号を合わせるために要る。
         ///       これで err の作り方・不等式の側・力積の上下限が Bullet と1対1で対応する。
         /// 軸そのものの選び方 (A基底 vs 混合軸) は <see cref="AngularMixedAxes"/> の担当で、こことは独立。</summary>
-        public static bool BulletAngleConvention = false;
+        public static bool BulletAngleConvention = true;   // ★完全セットv1 で既定ON (2026-08-23)
 
         /// <summary>A/B (既定 false = ビット不変): **ばねを Bullet 2.75 と同じ「モーター行」として解く。**
         /// タスク32。当エンジンは陽的力積 (`ApplySprings` で `-k*err*dt` を直接 ApplyImpulse し
@@ -207,6 +207,37 @@ namespace BulletPhysics
         ///   - 駆動ゲート (drivedp, モデルB) は7部位すべてで参照比が 1.00 へ寄る
         ///   - 静止ゲート (Tda スカート |Δp|) が参照比 8.43x → 3.84x</summary>
         public static bool SpringAsMotorRow = true;
+
+        /// <summary>タスク59: ロック軸 (lo==hi) の行を立てる条件を Bullet 2.75 の意味論へ
+        /// 揃える (既定 false = ビット不変)。
+        ///
+        /// Bullet の btRotationalLimitMotor::testLimitValue / btTranslationalLimitMotor::needApplyForce:
+        ///   testLimitValue: lo&gt;hi → 0 / v&lt;lo → 2 / v&gt;hi → 1 / それ以外 → **0**
+        ///   needApplyForce: m_currentLimit==0 かつ モーター無効 → **行を作らない**
+        /// つまり **ロック軸でも、変位がちょうど限界値のときは行が立たない**。
+        /// 当エンジンは IsLocked なら無条件に両側限界の行を立てていたので、
+        /// Bullet が自由にしている瞬間に速度拘束を掛けていた。
+        ///
+        /// 実測 (モデルA 髪網・移植姿勢): 行数が 自前239 / Bullet238 とずれ、
+        /// 余分な行は frame0 `髪BC1 dof2 並` / frame1 `前髪R dof2 並` と
+        /// **毎サブステップ1行前後、別のジョイントで間欠的に**現れていた。
+        /// 反復0 は共通行が完全一致 (4.86e-07) なのに反復1から崩れるのは、
+        /// この余分な行が反復0で解かれてインパルスを与えるため。
+        /// 最大差の行が余分な行と同じジョイントだったことも因果を裏づける。
+        ///
+        /// ★力積の上下限は変えない。Bullet も lo==hi のときは両側 (-INF,+INF) で、
+        ///   片側になるのは lo!=hi の違反時だけ。そちらは既に一致している
+        ///   (当エンジンの線形行は Bullet の鏡像なので上下限が入れ替わって対応する)。</summary>
+        public static bool BulletLimitRowGating = true;   // ★完全セットv1 で既定ON (2026-08-23)
+
+        /// <summary>Bullet の testLimitValue 相当。0=行不要 / 1=上限超過 / 2=下限未満。</summary>
+        private static int TestLimitValue(float v, float lo, float hi)
+        {
+            if (lo > hi) return 0;          // free
+            if (v < lo) return 2;
+            if (v > hi) return 1;
+            return 0;                       // ちょうど限界内 (ロック軸の err==0 を含む)
+        }
 
         /// <summary>Bullet 2.75 `btGeneric6DofSpringConstraint` の `m_springDamping` 既定値。
         /// PMX にはこの値が無いので **Bullet の既定 1.0 をそのまま使う**。つまみにしない。</summary>
@@ -242,7 +273,7 @@ namespace BulletPhysics
         //     J1ang=(anchorB-posA)×ax, J2ang=-(anchorB-posB)×ax → 誤差があると親へ e×P の結合トルクが伝わる
         //  2=Bullet2.8x系(offset, D6_USE_FRAME_OFFSET true 既定): 軸平行成分を除去した ortho +
         //     totalDist を質量比 factA=miB/(miA+miB) で分配。hasStaticBody&&!rotAllowed で fact スケール。
-        public static int LinearLeverMode = 0;
+        public static int LinearLeverMode = 1;   // ★完全セットv1 で既定ON (2026-08-23)
 
         // 内部状態。
         private readonly List<ConstraintRow> _rows = new(6);
@@ -385,6 +416,41 @@ namespace BulletPhysics
             // 既定 false のときは従来どおり qRel をそのまま使う = ビット不変。
             var euler = ToEulerXYZ(BulletAngleConvention ? qRel.Conjugated().Normalized : qRel.Normalized);
 
+            // ★タスク62: LIMGATE のときは、限界判定に食わせる変位を **Bullet の実計算鎖**で作る。
+            //   btGeneric6DofConstraint::calculateLinearInfo (btGeneric6DofConstraint.cpp:745)
+            //     m_calculatedLinearDiff = A.getBasis().inverse() * (originB - originA)
+            //   btGeneric6DofConstraint::calculateAngleInfo (同 345)
+            //     relative_frame = A.getBasis().inverse() * B.getBasis()
+            //     matrixToEulerXYZ(relative_frame, ...)
+            //   ★要点は inverse() が **転置ではなく余因子逆行列** であること (Matrix3x3.BulletInverse)。
+            //     当方は「列との内積」「四元数の共役積」で同じ値を数学的には出していたが、
+            //     どちらも厳密な 0 を保つ経路なので、バインド姿勢で誤差が **厳密に 0** になり、
+            //     testLimitValue が 0 (=行不要) を返して拘束が消えていた。
+            //     ノイズを真似るのではなく、Bullet と同じ変換・同じ減算順を通す。
+            Vec3 linDiffBt = default;
+            if (BulletLimitRowGating)
+            {
+                // ★鎖ごと Bullet に合わせる。要点は3つ、どれも「数学的に同じ・丸めが違う」。
+                //   (1) 関節フレームの基底は **行列同士の積**。当方は四元数の積 -> 行列だったので、
+                //       積がちょうど単位四元数になると基底が **厳密な単位行列** になり、
+                //       軸が (1,0,0)/(0,1,0)/(0,0,1) と割り切れてしまう。
+                //       Bullet は (1, 2.2e-08, 0) のような残差を必ず持つ。
+                //   (2) 原点も btTransform::operator() と同じ **行列×ベクトル + 原点**。
+                //   (3) 逆行列は転置ではなく余因子 (Matrix3x3.BulletInverse)。
+                //   バインド姿勢では変位の隙間が (1.5e-08, 0, 0) のように1軸だけ立つので、
+                //   残りの2軸が 0 になるか 3.3e-16 になるかは基底の残差だけで決まり、
+                //   それが testLimitValue の 0/1/2 = **行を作るか消すか** に直結する。
+                var bmA = Matrix3x3.FromQuatBullet(BodyA.WorldTransform.Rotation);
+                var bmB = Matrix3x3.FromQuatBullet(BodyB.WorldTransform.Rotation);
+                var basisAbt = bmA * Matrix3x3.FromQuatBullet(FrameInA.Rotation);
+                var basisBbt = bmB * Matrix3x3.FromQuatBullet(FrameInB.Rotation);
+                var oA = bmA * FrameInA.Origin + BodyA.WorldTransform.Origin;
+                var oB = bmB * FrameInB.Origin + BodyB.WorldTransform.Origin;
+                var invBasisA = basisAbt.BulletInverse();
+                linDiffBt = invBasisA * (oB - oA);
+                euler = ToEulerXYZBullet(invBasisA * basisBbt, BulletAngleConvention);
+            }
+
             // LinearLeverMode=2 用の前計算 (Bullet calculateTransforms / setLinearLimits 相当)。
             bool hasStatic = false; float factA = 0.5f, factB = 0.5f;
             Span<bool> angActive = stackalloc bool[3];
@@ -407,7 +473,8 @@ namespace BulletPhysics
             {
                 var axis = freezeLin ? _bindAxes[i] : _axesA[i];
                 float lo = LinearLowerLimit[i], hi = LinearUpperLimit[i];
-                float curF = linDelta.Dot(axis);
+                // タスク62: LIMGATE のときは Bullet の calculateLinearInfo と同じ鎖で作った値を使う。
+                float curF = (BulletLimitRowGating && !freezeLin) ? linDiffBt[i] : linDelta.Dot(axis);
                 if (IsFree(lo, hi))
                 {
                     // 自由軸 (lo>hi)。Bullet は limit=0 なのでモーターだけが行を作る。
@@ -417,6 +484,12 @@ namespace BulletPhysics
 
                 float cur = curF;
                 float err, lower, upper;
+                // タスク59: Bullet はロック軸でも変位がちょうど限界値なら行を作らない。
+                if (BulletLimitRowGating && IsLocked(lo, hi) && TestLimitValue(cur, lo, hi) == 0)
+                {
+                    if (SpringAsMotorRow) AddSpringMotorRow(false, i, axis, cur, lo, hi, rA, rB, invDt);
+                    continue;
+                }
                 if (IsLocked(lo, hi)) { err = lo - cur; lower = -1e18f; upper = 1e18f; }
                 else if (cur < lo) { err = lo - cur; lower = 0f; upper = 1e18f; }
                 else if (cur > hi) { err = hi - cur; lower = -1e18f; upper = 0f; }
@@ -491,6 +564,13 @@ namespace BulletPhysics
                 float cur = euler[i];
                 float err, lower, upper;
                 int sideCode;
+                // タスク59: 並進と同じ。ロック軸でちょうど限界値なら行なし。
+                if (BulletLimitRowGating && IsLocked(lo, hi) && TestLimitValue(cur, lo, hi) == 0)
+                {
+                    DebugAngularRows?.Add((Name, i, 1, cur, 0f));
+                    if (SpringAsMotorRow) AddSpringMotorRow(true, i, axis, cur, lo, hi, Vec3.Zero, Vec3.Zero, invDt);
+                    continue;
+                }
                 if (IsLocked(lo, hi)) { err = lo - cur; lower = -1e18f; upper = 1e18f; sideCode = 0; }
                 else if (cur < lo) { err = lo - cur; lower = 0f; upper = 1e18f; sideCode = 1; }
                 else if (cur > hi) { err = hi - cur; lower = -1e18f; upper = 0f; sideCode = 2; }
@@ -845,6 +925,51 @@ namespace BulletPhysics
                 }
                 _rows[r] = row;
             }
+        }
+
+        /// <summary>Bullet 2.75 matrixToEulerXYZ (btGeneric6DofConstraint.cpp:70) の**行列版**移植。
+        /// 四元数を経由せず、渡された行列の成分をそのまま読む。
+        ///
+        /// ★成分の読み方について。Bullet は btGetMatrixElem(mat, index) で
+        ///   i = index%3, j = index/3, mat[i][j] と読む。これは**列優先の添字を行優先の行列に当てる**
+        ///   ので、実際には転置の成分を読んでいる。当エンジンの BulletAngleConvention は
+        ///   この事実を四元数側で再現したものなので、行列版でも同じ切替を持たせて直交させる。
+        ///   bulletElem=true が Bullet の実挙動。
+        /// 分岐のしきい値も Bullet と同じく厳密な ±1.0 を使う (当方の ToEulerXYZ は 1e-6 の余裕を持つ)。</summary>
+        internal static Vec3 ToEulerXYZBullet(Matrix3x3 m, bool bulletElem)
+        {
+            // bulletElem: (i,j) を転置で読む = Bullet の btGetMatrixElem
+            float e02 = bulletElem ? m.Row2.x : m.Row0.z;   // index 2
+            float e12 = bulletElem ? m.Row2.y : m.Row1.z;   // index 5
+            float e22 = bulletElem ? m.Row2.z : m.Row2.z;   // index 8
+            float e01 = bulletElem ? m.Row1.x : m.Row0.y;   // index 1
+            float e00 = bulletElem ? m.Row0.x : m.Row0.x;   // index 0
+            float e10 = bulletElem ? m.Row0.y : m.Row1.x;   // index 3
+            float e11 = bulletElem ? m.Row1.y : m.Row1.y;   // index 4
+
+            float x, y, z;
+            if (e02 < 1f)
+            {
+                if (e02 > -1f)
+                {
+                    x = (float)Math.Atan2(-e12, e22);
+                    y = (float)Math.Asin(e02);
+                    z = (float)Math.Atan2(-e01, e00);
+                }
+                else
+                {
+                    x = -(float)Math.Atan2(e10, e11);
+                    y = -(float)(Math.PI / 2);
+                    z = 0f;
+                }
+            }
+            else
+            {
+                x = (float)Math.Atan2(e10, e11);
+                y = (float)(Math.PI / 2);
+                z = 0f;
+            }
+            return new Vec3(x, y, z);
         }
 
         // --- Euler XYZ 抽出 (Bullet の matrixToEulerXYZ 相当) ---

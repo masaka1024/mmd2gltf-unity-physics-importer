@@ -111,6 +111,24 @@ namespace BulletPhysics
 
         public Vec3 Column(int i) => new(Row0[i], Row1[i], Row2[i]);
 
+        /// <summary>Bullet 2.75 btMatrix3x3::setRotation (btMatrix3x3.h:136) の移植。
+        /// FromQuat と数学的には同じだが **式と丸めが違う**。
+        /// ロック軸の限界判定は「変位が厳密に 0 かどうか」で行を作る/作らないが決まるため、
+        /// この 1e-8 レベルの残差の有無がそのまま拘束の有無に化ける (タスク62)。</summary>
+        public static Matrix3x3 FromQuatBullet(Quat q)
+        {
+            float d = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+            float sc = 2f / d;
+            float xs = q.x * sc, ys = q.y * sc, zs = q.z * sc;
+            float wx = q.w * xs, wy = q.w * ys, wz = q.w * zs;
+            float xx = q.x * xs, xy = q.x * ys, xz = q.x * zs;
+            float yy = q.y * ys, yz = q.y * zs, zz = q.z * zs;
+            return new Matrix3x3(
+                new Vec3(1f - (yy + zz), xy - wz,        xz + wy),
+                new Vec3(xy + wz,        1f - (xx + zz), yz - wx),
+                new Vec3(xz - wy,        yz + wx,        1f - (xx + yy)));
+        }
+
         public static Vec3 operator *(Matrix3x3 m, Vec3 v) =>
             new(m.Row0.Dot(v), m.Row1.Dot(v), m.Row2.Dot(v));
 
@@ -125,6 +143,34 @@ namespace BulletPhysics
 
         public Matrix3x3 Transposed() =>
             new(Column(0), Column(1), Column(2));
+
+        private Vec3 R(int i) => i == 0 ? Row0 : (i == 1 ? Row1 : Row2);
+
+        /// <summary>Bullet 2.75 btMatrix3x3::inverse() の移植 (btMatrix3x3.h:536)。
+        /// **余因子行列 ÷ 行列式** であって転置ではない。直交行列なら数学的には転置と同じだが、
+        /// 浮動小数の値が違う: 転置は元の成分をそのまま並べ替えるので厳密な 0 が保たれるのに対し、
+        /// 余因子は積と差を通るので厳密な 0 にならない。
+        ///
+        /// ★これが効くのは Bullet がロック軸の変位 (testLimitValue に食わせる値) を
+        ///   calculateLinearInfo / calculateAngleInfo でこの逆行列から作っているため。
+        ///   転置で代用するとバインド姿勢のような「誤差が厳密に 0」の姿勢で
+        ///   testLimitValue が 0 (=行不要) を返しすぎ、拘束そのものが消える。
+        ///   実測 (タスク61): バインド姿勢の行数が Bullet 95 に対し当方 58 まで落ち、
+        ///   髪が1ステップで自由落下 (g·dt² の全量 0.0272) した。</summary>
+        public Matrix3x3 BulletInverse()
+        {
+            var self = this;   // struct 内のローカル関数は this を触れないのでコピーする
+            float Cofac(int r1, int c1, int r2, int c2) =>
+                self.R(r1)[c1] * self.R(r2)[c2] - self.R(r1)[c2] * self.R(r2)[c1];
+
+            var co = new Vec3(Cofac(1, 1, 2, 2), Cofac(1, 2, 2, 0), Cofac(1, 0, 2, 1));
+            float det = Row0.Dot(co);
+            float sc = 1f / det;
+            return new Matrix3x3(
+                new Vec3(co.x * sc, Cofac(0, 2, 2, 1) * sc, Cofac(0, 1, 1, 2) * sc),
+                new Vec3(co.y * sc, Cofac(0, 0, 2, 2) * sc, Cofac(0, 2, 1, 0) * sc),
+                new Vec3(co.z * sc, Cofac(0, 1, 2, 0) * sc, Cofac(0, 0, 1, 1) * sc));
+        }
 
         /// <summary>this * diag(scale) * this^T — basis に対角テンソルを回転適用。</summary>
         public Matrix3x3 Scaled(Vec3 scale)

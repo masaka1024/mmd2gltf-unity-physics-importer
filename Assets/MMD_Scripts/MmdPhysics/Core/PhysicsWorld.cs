@@ -98,7 +98,17 @@ namespace BulletPhysics
         //   駆動中はキネマティック剛体が動的剛体を押し込む。押し戻す手段を丸ごと外すと戻れない。
         //   ★教訓: **接触まわりの変更を静止だけで判断しない。必ず hairfid で駆動系を通す。**
         //     (BAUM env を hairfid に追加済み。BAUM=0.2 で変更前を再現できる)
+
         public float BaumgarteFactor = 0.2f;
+
+        /// <summary>★タスク48: 接触の rhs を Bullet 2.75 の一本式にする (既定 false = ビット不変)。
+        /// 当エンジンは貫入/分離で2枝に分かれており、実測で次の差が出ていた:
+        ///   分離枝に erp が掛かっておらず (-dist/dt)、Bullet (-dist*erp/dt) より **5倍 緩い**。
+        ///   その結果 法線インパルスが系統的に小さく出る (モデルB スカート網の反復0で 19/25 ペアが乖離、
+        ///   差は上位12ペアすべて負)。深さ差のあるペアには集中していなかったので、
+        ///   種は接触生成ではなく **rhs の式** と特定した。
+        /// 差1〜3 を個別フラグにはしない。Bullet 側が1つの式なので、分けると存在しない中間状態を作る。</summary>
+        public bool ContactRhsBullet = true;   // ★完全セットv1 で既定ON (2026-08-23)
         public float RestitutionThreshold = 1.0f;
 
         // --- Split Impulse (接触の貫入回復を実速度から切り離す) ---
@@ -256,7 +266,10 @@ namespace BulletPhysics
         {
             float sub = dt / SubSteps;
             for (int s = 0; s < SubSteps; s++)
+            {
+                DebugSubStep = s;   // 診断CSVの substep 列用 (フックが null でも代入のみ = ビット不変)
                 SubStep(sub, (float)(gBase + s + 1) / totalSub);
+            }
         }
 
         // frac: フレーム開始→終端目標の 等分補間割合 (1/totalSub .. 1)。フレーム全体で連続する。
@@ -299,13 +312,13 @@ namespace BulletPhysics
                     // Bullet 2.75 同順: ジョイント → 接触 (接触が後勝ち)。
                     if (doJoints) foreach (var j in Joints) j.SolveVelocity();
                     if (ProfileEnabled) ProfSolveJoint += Tick();
-                    if (doContacts) SolveContacts();
+                    if (doContacts) { _contactIter = it; SolveContacts(); }
                     if (ProfileEnabled) ProfSolveContact += Tick();
                 }
                 else
                 {
                     // 従来順: 接触 → ジョイント (ジョイントが後勝ち)。
-                    if (doContacts) SolveContacts();
+                    if (doContacts) { _contactIter = it; SolveContacts(); }
                     if (ProfileEnabled) ProfSolveContact += Tick();
                     if (doJoints) foreach (var j in Joints) j.SolveVelocity();
                     if (ProfileEnabled) ProfSolveJoint += Tick();
@@ -515,7 +528,7 @@ namespace BulletPhysics
         /// 既定 false は従来の線形化更新 (q += 0.5*w*q*dt) でビット不変。
         /// Bullet の btTransformUtil::integrateTransform は QUATERNION_DERIVATIVE を
         /// #ifdef で切っており、走るのは指数写像のほう。</summary>
-        public static bool BulletRotationIntegration = false;
+        public static bool BulletRotationIntegration = true;   // ★完全セットv1 で既定ON (2026-08-23)
 
         /// <summary>Bullet ANGULAR_MOTION_THRESHOLD = 0.5 * SIMD_HALF_PI。</summary>
         private const float AngularMotionThreshold = 0.5f * (float)(Math.PI * 0.5);
@@ -678,6 +691,9 @@ namespace BulletPhysics
                 GjkEpa.Detect(a, b, _detectBuffer);
                 for (int di = 0; di < _detectBuffer.Count; di++)
                     m.AddPoint(_detectBuffer[di]);
+                // ★タスク68: 今フレームのナローフェーズに確認されなかった深い点を落とす。
+                //   Detect / AddPoint の **後** でないと「確認されたか」が決まらない。
+                m.PruneStaleDeep();
             }
             // 消えたペアを掃除。
             if (_manifolds.Count > seen.Count)
@@ -769,7 +785,35 @@ namespace BulletPhysics
                     float rest = (float)Math.Sqrt(Math.Max(0, a.Restitution) * Math.Max(0, b.Restitution));
                     float restBias = (-relN > RestitutionThreshold) ? rest * -relN : 0f;
 
-                    if (cp.Distance <= 0f)
+                    if (ContactRhsBullet)
+                    {
+                        // ★タスク48: Bullet 2.75 の **枝分かれの無い一本式** をそのまま使う。
+                        //   btSequentialImpulseConstraintSolver.cpp:542-595
+                        //     penetration     = cp.getDistance() + m_linearSlop   (m_linearSlop 既定 0)
+                        //     positionalError = -penetration * m_erp / dt         (m_erp = BaumgarteFactor)
+                        //     velocityError   = restitution - rel_vel
+                        //     m_rhs           = (positionalError + velocityError) * jacDiagABInv
+                        //   当エンジンの求解は dPn = (NormalBias - relN) * NormalMass なので、
+                        //   NormalBias = positionalError + restitution と置けば
+                        //   (positionalError + restitution - relN) となり Bullet と厳密に同じ式になる。
+                        //   ★従来との違いは3つ (個別フラグにはしない。1つの式なので):
+                        //     1. 分離 (dist>0) にも erp が掛かる。従来は -dist/dt で **5倍 緩かった**
+                        //     2. 貫入で PenetrationSlop を引かない (Bullet の m_linearSlop は 0)
+                        //     3. 反発を max ではなく **和** で載せる
+                        float penB = cp.Distance;                       // + m_linearSlop (=0)
+                        float posErr = -penB * BaumgarteFactor / dt;
+                        if (UseSplitImpulse && penB <= SplitImpulsePenetrationThreshold)
+                        {
+                            cc.NormalBias = restBias;                   // 実速度側: 反発のみ
+                            cc.PushBias = posErr;                       // 擬似速度側: 位置補正
+                        }
+                        else
+                        {
+                            cc.NormalBias = posErr + restBias;
+                            cc.PushBias = 0f;
+                        }
+                    }
+                    else if (cp.Distance <= 0f)
                     {
                         // 貫入: Baumgarte 位置補正 + 反発。
                         float pen = -cp.Distance - PenetrationSlop;
@@ -796,7 +840,7 @@ namespace BulletPhysics
                         float speculative = -cp.Distance / dt;
                         cc.NormalBias = Math.Min(speculative, restBias);
                     }
-                    DebugContactRows?.Add((a.Name, b.Name, cp.PositionWorldA, cp.PositionWorldB, n,
+                    DebugContactRows?.Add((DebugSubStep, a.Name, b.Name, cp.PositionWorldA, cp.PositionWorldB, n,
                         cp.Distance, cc.NormalBias, cc.PushBias, cc.Friction, cc.NormalMass,
                         cp.NormalImpulse, cp.TangentImpulse1, cp.TangentImpulse2));
                     _contacts.Add(cc);
@@ -833,9 +877,27 @@ namespace BulletPhysics
         /// 生成情報と行の係数を記録する。Bullet 2.75 の manifold / btSolverConstraint と
         /// 同じ土俵で「点数・位置・法線・深さ・bias・摩擦・実効質量・warm引き継ぎ量」を並べるため。
         /// `DebugContacts` と同じ流儀。</summary>
-        public System.Collections.Generic.List<(string a, string b, Vec3 pA, Vec3 pB, Vec3 n,
+        public System.Collections.Generic.List<(int sub, string a, string b, Vec3 pA, Vec3 pB, Vec3 n,
             float dist, float normalBias, float pushBias, float friction,
             float normalMass, float warmNormal, float warmT1, float warmT2)> DebugContactRows;
+
+        /// <summary>★タスク47: 接触行の **反復単位** の読み取り専用フック (既定 null = 何もしない)。
+        /// 1エントリ = (反復, 剛体A, 剛体B, 接触点index, 累積法線インパルス, 累積摩擦1, 累積摩擦2,
+        ///              法線が下限0でクランプされたか, 摩擦1が上限でクランプされたか,
+        ///              法線方向の相対速度(この反復で解く直前))。
+        /// ジョイント側の `Joint.DebugRows` と同じ家風: null の間は分岐1つぶんしか触らないのでビット不変。
+        /// 第一不一致点が「反復0の接触求解」と判ったので、その中身を見るために足した。</summary>
+        public System.Collections.Generic.List<(int iter, string a, string b, int pt,
+            float ni, float t1, float t2, bool nClamp, bool tClamp, float relN,
+            float fric, float maxT, float relT, float tanMass)> DebugContactIterRows;
+
+        /// <summary>DebugContactIterRows へ書く反復番号。求解ループが毎反復セットする。</summary>
+        private int _contactIter;
+
+        /// <summary>診断用: 今どのサブステップか。接触CSVの substep 列を正しく出すために要る。
+        /// 以前これが無く、NetDump が substep 列へ点index を書いていたため、
+        /// 自前だけ全サブステップぶんが混ざって点数が約2倍に見えていた。</summary>
+        public int DebugSubStep;
 
         // 蓄積インパルスを manifold へ書き戻し、次フレームのウォームスタートに使う。
         private void StoreImpulses()
@@ -891,6 +953,7 @@ namespace BulletPhysics
                         SolveFriction(ref c, c.A, c.B, c.Tangent2, c.TangentMass2, ref c.TangentImpulse2);
                     _contacts[i] = c;
                 }
+                EmitContactIterRows();
                 return;
             }
             for (int i = 0; i < _contacts.Count; i++)
@@ -914,6 +977,31 @@ namespace BulletPhysics
                 }
 
                 _contacts[i] = c;
+            }
+            EmitContactIterRows();
+        }
+
+        // 反復ごとの接触行を出す (フックが null の間は即 return = ビット不変)。
+        private void EmitContactIterRows()
+        {
+            var sink = DebugContactIterRows;
+            if (sink == null) return;
+            for (int i = 0; i < _contacts.Count; i++)
+            {
+                var c = _contacts[i];
+                // 法線方向の相対速度 (符号規約は SolveNormal と同じ)。
+                var dv = (c.B.LinearVelocity + Vec3.Cross(c.B.AngularVelocity, c.RelB))
+                       - (c.A.LinearVelocity + Vec3.Cross(c.A.AngularVelocity, c.RelA));
+                float relN = dv.Dot(c.Normal);
+                float maxT = c.Friction * c.NormalImpulse;
+                // ★タスク49: 摩擦が0になる直接原因を割るための量。
+                //   摩擦係数 / 上限 (μ×Pn) / 1本目接線方向の相対速度 / 接線の実効質量。
+                float relT = dv.Dot(c.Tangent1);
+                sink.Add((_contactIter, c.A.Name, c.B.Name, c.PointRef,
+                          c.NormalImpulse, c.TangentImpulse1, c.TangentImpulse2,
+                          c.NormalImpulse <= 0f,
+                          maxT > 0f && Math.Abs(c.TangentImpulse1) >= maxT * 0.999999f,
+                          relN, c.Friction, maxT, relT, c.TangentMass1));
             }
         }
 
