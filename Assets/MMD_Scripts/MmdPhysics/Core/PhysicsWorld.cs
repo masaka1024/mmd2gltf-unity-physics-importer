@@ -188,7 +188,7 @@ namespace BulletPhysics
         /// **SOLVER_USE_2_FRICTION_DIRECTIONS が立っていない** ため摩擦は1本。
         /// 方向は convertContact で `vel - n*(n·vel)` を正規化したもの (接線速度が実質ゼロなら
         /// btPlaneSpace1 の任意基底)。当エンジンは常に直交2方向を張る。</summary>
-        public bool FrictionVelocityAligned = false;
+        public bool FrictionVelocityAligned = true;   // ★タスク81 で既定化 (2026-08-25)
 
         /// <summary>(4) 摩擦係数の合成を Bullet と同じ **積** にする。
         /// Bullet: `btManifoldResult::calculateCombinedFriction` = `f0 * f1`。
