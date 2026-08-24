@@ -425,7 +425,7 @@ namespace Mmd2GltfImporter
 
                 // ★半透明(BLEND)かつテクスチャありはTwoPass(2)：Normal(0)は深度書き込みが
                 //   無く、髪の房や顔パーツの重なりで描画順が狂いグレーの筋状アーティファクトが
-                //   出るため(IAモデルで実機確認済み)。テクスチャ無しの半透明(レンズ等の
+                //   出るため(モデルAで実機確認済み)。テクスチャ無しの半透明(レンズ等の
                 //   単色ガラス)は従来どおりNormalでよい。
                 //   lilToon.TransparentMode: 0=Normal, 1=OnePass, 2=TwoPass
                 int transparentMode = 0;
@@ -438,7 +438,7 @@ namespace Mmd2GltfImporter
                 SetupLilToonRenderingMode(mat, modeInt, transparentMode, hasOutline);
 
                 // ★レンダーキュー制御(半透明越しの消失バグ対策)：
-                //   共有テクスチャのモデル(Tda式ミクV4X等)では全マテリアルにorigTextureが
+                //   共有テクスチャのモデル(モデルB等)では全マテリアルにorigTextureが
                 //   付き、全員がTransparent(q3000)へ昇格してしまう。透明キュー内は
                 //   サブメッシュ番号順+深度書き込み(TwoPass)で描画されるため、
                 //   「前髪(若い番号)の向こう側にあるメガネ(大きい番号)が深度テストに

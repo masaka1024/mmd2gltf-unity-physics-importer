@@ -205,7 +205,7 @@ namespace BulletPhysics
         ///     31モデル 中央 改善13・悪化5、拘束違反 改善10・悪化9、NaN 発散 0 /
         ///     最小網 ビット不変 / モデルR はクランプ非適用でも NaN なし
         ///   - 駆動ゲート (drivedp, モデルB) は7部位すべてで参照比が 1.00 へ寄る
-        ///   - 静止ゲート (Tda スカート |Δp|) が参照比 8.43x → 3.84x</summary>
+        ///   - 静止ゲート (モデルB スカート |Δp|) が参照比 8.43x → 3.84x</summary>
         public static bool SpringAsMotorRow = true;
 
         /// <summary>タスク59: ロック軸 (lo==hi) の行を立てる条件を Bullet 2.75 の意味論へ

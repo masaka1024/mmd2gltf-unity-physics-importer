@@ -124,7 +124,7 @@ namespace BulletPhysics.Unity
         // ★PMX mode2 (物理演算+ボーン位置合わせ) の実装 (2026-08-10)。
         //   mode2 剛体は「位置はボーン階層から、回転は物理から」がMMDの仕様。従来これが未実装で
         //   mode1 と同じ完全自由になっていたため、スカートがMMDより柔らかかった
-        //   (Tda式初音ミクV4X はスカート66個中32個が mode2。実測で揺れ幅 0.257→0.188)。
+        //   (モデルB はスカート66個中32個が mode2。実測で揺れ幅 0.257→0.188)。
         //   既定ON。mode2 剛体を持たないモデル(IA等)では何もしないので無影響。
         //   OFF にすると従来どおり mode2 を mode1 と同じ扱いにする (A/B 比較用)。
         [Tooltip("PMX mode2(物理演算+ボーン位置合わせ)を再現する。OFFで従来どおりmode1と同一扱い")]
@@ -451,7 +451,7 @@ namespace BulletPhysics.Unity
             //      Unityのフレームは FixedUpdate → Update → [Animator適用] → LateUpdate の順なので、
             //      FixedUpdate で書いた物理姿勢は、そのボーンにカーブがあると Animator に必ず潰される。
             //      症状: クリップがスカート/髪のカーブ(レストポーズの定数キーでも可)を持つモデルで、
-            //      再生1フレーム目から揺れ物がレストポーズのまま固定される(コロン式で発現)。
+            //      再生1フレーム目から揺れ物がレストポーズのまま固定される(モデルEで発現)。
             //      IA は本体のみベイクで揺れ物カーブが無いため表面化していなかった。
         }
 
@@ -539,7 +539,7 @@ namespace BulletPhysics.Unity
             //   従来は AlignBonePositions という全剛体一律のトグルにだけ繋がれていた。
             //   ここで mode2 の剛体に限り常時適用する。
             //   ※最初の実装で「剛体そのものを毎ステップ位置固定し並進速度をゼロにする」方式を試したが、
-            //     旋回時に遠心力を担う並進速度まで消えて髪が軸へ collapse した (Tda式で振幅1.16→2.19、
+            //     旋回時に遠心力を担う並進速度まで消えて髪が軸へ collapse した (モデルBで振幅1.16→2.19、
             //     最小半径2.73→1.70)。シミュレーションには触れないのが正しい。
             bool needAligned = AlignBonePositions || (EnableBoneMergeMode && _builder.HasBoneMergeBodies);
             RigidTransform?[] aligned = needAligned ? _builder.ComputeAlignedBonePoses(BoneWorldOrNull, AlignRotClampAlpha, AlignBonePositions) : null;

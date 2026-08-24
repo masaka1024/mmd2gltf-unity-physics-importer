@@ -180,7 +180,7 @@ The custom Bullet-compatible engine now produces **noticeably closer-to-MMD beha
 path did in practice**, so **the PhysX path has been removed** to avoid maintaining two implementations.
 
 > This does not mean it matches MMD. Numerical fidelity has only ever been validated against a
-> single model (IA), those numbers predate recent fixes, and some aspects — such as jitter at rest —
+> a single model (model A), those numbers predate recent fixes, and some aspects — such as jitter at rest —
 > are still **worse** than MMD (see "Known limitations").
 
 | | Old | Current |
