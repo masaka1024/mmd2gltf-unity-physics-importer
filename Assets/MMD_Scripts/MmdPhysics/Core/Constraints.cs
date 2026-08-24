@@ -201,7 +201,7 @@ namespace BulletPhysics
         ///   - 行レベルで Bullet と等価と確認済み (ばね付き最小網 24行×10反復、
         ///     effMass 4.1e-07 / bias 2.7e-04 / 累積力積 2.75e-04 = float 丸めの範囲)
         ///   - 当てるパラメータをひとつも作っていない (係数は全て Bullet 実ソースの値)
-        ///   - 採用ゲート全通過: bonecheck ビット不変 (IA はばね0) /
+        ///   - 採用ゲート全通過: bonecheck ビット不変 (モデルA はばね0) /
         ///     31モデル 中央 改善13・悪化5、拘束違反 改善10・悪化9、NaN 発散 0 /
         ///     最小網 ビット不変 / モデルR はクランプ非適用でも NaN なし
         ///   - 駆動ゲート (drivedp, モデルB) は7部位すべてで参照比が 1.00 へ寄る
@@ -274,6 +274,34 @@ namespace BulletPhysics
         //  2=Bullet2.8x系(offset, D6_USE_FRAME_OFFSET true 既定): 軸平行成分を除去した ortho +
         //     totalDist を質量比 factA=miB/(miA+miB) で分配。hasStaticBody&&!rotAllowed で fact スケール。
         public static int LinearLeverMode = 1;   // ★完全セットv1 で既定ON (2026-08-23)
+
+        /// <summary>★タスク78: 腕長ゲート。`LinearLeverMode=1` の潜在不安定だけを止める。
+        /// 0 (既定) で完全に無効 = ビット不変。
+        ///
+        /// `LEVER=1` は Bullet 2.75 の実経路そのままで、線形行の A 側の腕を **B 側ピボット基準**
+        /// にとる (`btGeneric6DofConstraint.cpp:781-792`)。このためアンカー誤差が開くと腕が
+        /// そのぶん伸び、実効質量の分母が腕の 2乗 で効くので行が急速に弱る。
+        /// 弱った行は誤差をさらに開かせるので **正のフィードバック** になり、実測では
+        /// 毎フレーム約 1.27 倍の等比で誤差が 0.05 → 340 まで走った (もみあげの房が脱落)。
+        ///
+        /// ゲートは「アンカー誤差がこのジョイント自身の腕の長さに対して大きすぎるとき」だけ、
+        /// その行の A 側の腕を `LEVER=0` と同じ **自分自身のアンカー** (`rA`) へ落とす。
+        /// 閾値を絶対長ではなく `(|rA|+|rB|)` 比にしてあるのは、モデルのスケールに依らせないため。
+        ///
+        /// **これは Bullet に無い規則である。** 2.75 に忠実であることが PMXe には存在しない
+        /// 破綻を生む事例なので、NORTH_STAR 0 の「出力を優先する」側で入れている。
+        /// Bullet 自身も 2.8x でこの箇所を作り変えている (`D6_USE_FRAME_OFFSET` = `LEVER=2`)。</summary>
+        public static float LeverArmGate = 5f;   // ★タスク78 で既定化 (2026-08-24)
+
+        /// <summary>診断用: 腕長ゲートが発動した行数の累計 (ゲートが平時に発動しないことの確認用)。</summary>
+        public static long LeverArmGateHits;
+
+        /// <summary>診断用: 腕長比 `|anchorB-anchorA| / (|rA|+|rB|)` の分布。閾値を実測から決めるため。
+        /// `LeverArmProbe` を立てた間だけ数える (既定 false = 何もしない)。</summary>
+        public static bool LeverArmProbe;
+        public static float LeverArmRatioMax;
+        public static readonly long[] LeverArmRatioOver = new long[6];   // >0.25,0.5,1,2,5,10
+        public static long LeverArmRatioN;
 
         // 内部状態。
         private readonly List<ConstraintRow> _rows = new(6);
@@ -508,6 +536,24 @@ namespace BulletPhysics
                 {
                     armA = _anchorB - BodyA.CenterOfMass;   // 両剛体とも B側アンカー基準
                     armB = rB;
+                    // ★タスク78: 腕長ゲート。誤差が自分の腕に対して大きすぎたら rA へ落とす。
+                    if (LeverArmGate > 0f || LeverArmProbe)
+                    {
+                        float scale = rA.Length + rB.Length;
+                        float ratio = scale > 1e-9f ? (_anchorB - _anchorA).Length / scale : 0f;
+                        if (LeverArmProbe)
+                        {
+                            LeverArmRatioN++;
+                            if (ratio > LeverArmRatioMax) LeverArmRatioMax = ratio;
+                            if (ratio > 0.25f) LeverArmRatioOver[0]++;
+                            if (ratio > 0.5f) LeverArmRatioOver[1]++;
+                            if (ratio > 1f) LeverArmRatioOver[2]++;
+                            if (ratio > 2f) LeverArmRatioOver[3]++;
+                            if (ratio > 5f) LeverArmRatioOver[4]++;
+                            if (ratio > 10f) LeverArmRatioOver[5]++;
+                        }
+                        if (LeverArmGate > 0f && ratio > LeverArmGate) { armA = rA; LeverArmGateHits++; }
+                    }
                 }
                 else if (LinearLeverMode == 2)
                 {
@@ -650,7 +696,17 @@ namespace BulletPhysics
             //   ★診断フックより **前** に決めること: ここを後回しにすると DebugRows の相対速度だけが
             //     補正前の rA で出て、アンカーの離れた横渡し型で最大90%の偽の不一致になる (タスク34)。
             Vec3 armA = rA, armB = rB;
-            if (LinearLeverMode == 1) armA = _anchorB - BodyA.CenterOfMass;
+            if (LinearLeverMode == 1)
+            {
+                armA = _anchorB - BodyA.CenterOfMass;
+                // ★タスク78: リミット行と同じ腕長ゲートを通す (規約を揃えないと実効質量がずれる)。
+                if (LeverArmGate > 0f)
+                {
+                    float gscale = rA.Length + rB.Length;
+                    if ((_anchorB - _anchorA).Length > LeverArmGate * gscale)
+                    { armA = rA; LeverArmGateHits++; }
+                }
+            }
             // 診断フック: モーター行も限界行と同じスキーマで出す (err の欄には delta を入れる)。
             //   これが無いと ROWTRACE の行数がソルバの行数と合わない (タスク34)。
             if (DebugRows != null)
@@ -726,17 +782,17 @@ namespace BulletPhysics
         //   陽的(前進オイラー)ばね impulse = -k*err*dt は k*dt²/m が 1 を超えると必ず発散する。
         //   1ステップの速度変化が k*err*dt/m、それが次ステップの誤差を |err| より大きくするため、
         //   誤差が毎ステップ k*dt²/m 倍に増幅されるからである。
-        //   実測: ぬこ式レーシングミク2023 は spring=100000 に対し錘の質量 0.01 で
+        //   実測: モデルC は spring=100000 に対し錘の質量 0.01 で
         //   k*dt²/m = 2778 → 毎ステップ約30倍に発散し、25ステップで float が溢れて NaN になった
         //   (ツインテール先端の錘が起点。重力ゼロでも発散するので外力ではなくばねが原因)。
         //   PMXモデルの 6/13 が同じ発散域にあり、これまで表面化しなかったのは忠実度検証に使っていた
-        //   IA のジョイントがばね定数ゼロだったため（＝1モデルでの検証は安定性を保証しない）。
+        //   モデルA のジョイントがばね定数ゼロだったため（＝1モデルでの検証は安定性を保証しない）。
         //
         //   対策: 力積を「1ステップで誤差をちょうど打ち消す量」= |err| * mEff / dt で頭打ちにする。
         //   これは k*dt²/m = 1（デッドビート）に相当する安定限界で、行き過ぎが原理的に起きない。
         //   mEff はソルバ本体 (AddLinearRow / AddAngularRow) と同一の式で求めるため、
         //   クランプが効かない範囲 (k*dt²/m < 1) では従来と1ビットも変わらない。
-        //   実測A/B(300step 全剛体姿勢ハッシュ): IA系3モデルはビット完全一致、Racing_Miku2023 は NaN→完走。
+        //   実測A/B(300step 全剛体姿勢ハッシュ): モデルA系3モデルはビット完全一致、モデルC は NaN→完走。
         public void ApplySprings(float dt)
         {
             if (BodyA == null || BodyB == null) return;

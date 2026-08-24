@@ -68,7 +68,7 @@ namespace BulletPhysics
         //   接触が生成された時点で既に深く刺さっており、貫入オンセットの 58% は
         //   「前フレームに接触点ゼロ」から始まっていた。刻みを半分にすると 1ステップの移動量が減り、
         //   ソルバが押し出す機会も増えるので両方に効く。
-        //   実測(5モデル): 貫入中央 -45〜-63%、悪化したモデルは無し。深貫入>0.5 は IA で 5件→0件、
+        //   実測(5モデル): 貫入中央 -45〜-63%、悪化したモデルは無し。深貫入>0.5 は モデルA で 5件→0件、
         //   hairfid 7001フレームで 20件→0件。
         //   ★忠実度も同時に改善する: 12窓比 中央 1.0608 → 0.9867 (過去最良)、
         //   スカート p90 22.16 → 25.98 (MMD 25.66)。8 は行き過ぎ (傾き14.30/12窓比1.181)。
@@ -87,9 +87,9 @@ namespace BulletPhysics
         //     駆動なし(バインド姿勢)で揺れ物が止まらない主因が接触の位置補正
         //     biasVel = BaumgarteFactor * pen / dt が実速度に載ることだと実測。
         //     31モデルの静止スイープで悪化ゼロ・改善多数だった
-        //     (Tda式V4X 342.9->1.07 / ゆかりver7 181.2->6.96 / 貫入も同時に減少)。
+        //     (モデルB 342.9->1.07 / モデルY 181.2->6.96 / 貫入も同時に減少)。
         //
-        //   ★却下の決め手 (hairfid, IA + 駆動CSV 7001F, 深貫入>0.5 のイベント数):
+        //   ★却下の決め手 (hairfid, モデルA + 駆動CSV 7001F, 深貫入>0.5 のイベント数):
         //     BaumgarteFactor=0.2 -> **0件** (最大貫入 0.000)
         //     BaumgarteFactor=0   -> **1992件** (最大貫入 1.144, うち静区間1824)
         //     MMD自身(幾何・同分母) = 66件
@@ -193,7 +193,7 @@ namespace BulletPhysics
         /// <summary>(4) 摩擦係数の合成を Bullet と同じ **積** にする。
         /// Bullet: `btManifoldResult::calculateCombinedFriction` = `f0 * f1`。
         /// 当エンジン: `sqrt(f0 * f1)`。例: 0.8 と 0.5 なら Bullet 0.40 / 当エンジン 0.632。</summary>
-        public bool FrictionCombineMultiply = false;
+        public bool FrictionCombineMultiply = true;   // ★タスク78 で既定化 (2026-08-24)
 
         public readonly List<RigidBody> Bodies = new();
         public readonly List<Joint> Joints = new();
@@ -354,7 +354,7 @@ namespace BulletPhysics
         //  スリープ (Bullet の deactivation 相当) — 2026-08-10 実装
         //
         //  症状: ほとんど静止しているのに揺れ物が細かく震え続ける。MMD(Bullet)は静止した
-        //  剛体を非活性化して計算から外すので完全に止まる (ユーザー実機でMMDのIAの序盤=静止
+        //  剛体を非活性化して計算から外すので完全に止まる (ユーザー実機でMMDのモデルAの序盤=静止
         //  ポーズ中は髪の揺れが止まることを確認済み)。当エンジンは RigidBody に IsActive /
         //  SleepTimer の宣言だけがあり、どこからも使われていなかった。
         //
@@ -369,7 +369,7 @@ namespace BulletPhysics
         //    動き続けるので、髪もスカートも常に起きたままになる。
         // ═══════════════════════════════════════════
         //  ★既定 OFF (2026-08-10)。実装はしたが現状ほとんど発動しない: 当エンジンの静止時の
-        //    残留運動が Bullet のしきい値を超えているため (IA で |w|平均 1.5 > しきい値 1.0)。
+        //    残留運動が Bullet のしきい値を超えているため (モデルA で |w|平均 1.5 > しきい値 1.0)。
         //    101体中 2体しか眠らず、効果が無い一方で「起こし損ねると固まる」リスクだけが残る。
         //    残留運動そのものを下げる方が先。下げられたら既定ONを検討する。
         public bool EnableSleeping = false;
@@ -617,7 +617,7 @@ namespace BulletPhysics
         // --- ブロードフェーズの候補ペア (最適化, 2026-08-09) ---
         // static/kinematic 同士の除外と ShouldCollide(Group/Mask) は「不変な情報」なので毎サブステップ
         // 総当たりで再判定する必要がない。初回に候補ペアを作り置きし、以後はそれだけを走査する。
-        // (IA: 総当たり6786 → 候補のみへ削減。ペア順序は i昇順→k昇順 で従来と同一=結果ビット不変)
+        // (モデルA: 総当たり6786 → 候補のみへ削減。ペア順序は i昇順→k昇順 で従来と同一=結果ビット不変)
         // 剛体の追加や Group/CollisionMask/Mode を実行時に変更した場合は InvalidateCollisionPairs() を呼ぶこと
         // (AddBody は自動で無効化する。ハーネスは構築直後に変更するため初回構築前に確定する)。
         private int[] _pairA, _pairB; private int _pairCount = -1; private int _pairBuiltForCount = -1;
@@ -760,7 +760,12 @@ namespace BulletPhysics
                         var vrel = b.VelocityAtPoint(cp.PositionWorldB) - a.VelocityAtPoint(cp.PositionWorldA);
                         var lat = vrel - n * vrel.Dot(n);
                         float l2 = lat.LengthSquared;
-                        if (l2 > 1e-12f) { t1 = lat / (float)Math.Sqrt(l2); t2 = Vec3.Cross(t1, n); }
+                        // ★タスク73: フォールバック閾値は Bullet の SIMD_EPSILON (=FLT_EPSILON)。
+                        //   btSequentialImpulseConstraintSolver.cpp:619 `lat_rel_vel > SIMD_EPSILON`。
+                        //   従来の 1e-12 は |lat| にして 340倍 きつく、接線速度がほぼ無い接触でも
+                        //   数値ノイズから向きを作ってしまっていた。Bullet はそこを btPlaneSpace1
+                        //   (法線だけから決まる安定な基底) へ落とす。
+                        if (l2 > 1.1920929e-07f) { t1 = lat / (float)Math.Sqrt(l2); t2 = Vec3.Cross(t1, n); }
                         useT2 = false;   // Bullet 既定は摩擦1方向
                     }
 
@@ -889,7 +894,8 @@ namespace BulletPhysics
         /// 第一不一致点が「反復0の接触求解」と判ったので、その中身を見るために足した。</summary>
         public System.Collections.Generic.List<(int iter, string a, string b, int pt,
             float ni, float t1, float t2, bool nClamp, bool tClamp, float relN,
-            float fric, float maxT, float relT, float tanMass)> DebugContactIterRows;
+            float fric, float maxT, float relT, float tanMass,
+            Vec3 t1dir, Vec3 nDir)> DebugContactIterRows;
 
         /// <summary>DebugContactIterRows へ書く反復番号。求解ループが毎反復セットする。</summary>
         private int _contactIter;
@@ -908,8 +914,13 @@ namespace BulletPhysics
                 if (c.Manifold == null || c.PointRef >= c.Manifold.Points.Count) continue;
                 var cp = c.Manifold.Points[c.PointRef];
                 cp.NormalImpulse = c.NormalImpulse;
-                cp.TangentImpulse1 = c.TangentImpulse1;
-                cp.TangentImpulse2 = c.TangentImpulse2;
+                // ★タスク73: Bullet は SOLVER_USE_FRICTION_WARMSTARTING が無いので
+                //   接線力積を接触点へ書き戻さない (恒久的に 0 のまま)。
+                if (!FrictionVelocityAligned)
+                {
+                    cp.TangentImpulse1 = c.TangentImpulse1;
+                    cp.TangentImpulse2 = c.TangentImpulse2;
+                }
                 c.Manifold.Points[c.PointRef] = cp;
                 DebugContacts?.Add((c.A.Name, c.B.Name, cp.Distance, c.NormalImpulse));
             }
@@ -921,6 +932,18 @@ namespace BulletPhysics
             for (int i = 0; i < _contacts.Count; i++)
             {
                 var c = _contacts[i];
+                // ★タスク73: Bullet 2.75 の既定 solverMode は
+                //   `SOLVER_USE_WARMSTARTING | SOLVER_SIMD` (btContactSolverInfo.h:80) で、
+                //   **SOLVER_USE_FRICTION_WARMSTARTING が入っていない**。したがって Bullet は
+                //   摩擦行を warm-start しない (btSequentialImpulseConstraintSolver.cpp:660 の門が閉じ、
+                //   1102 で m_appliedImpulseLateral1/2 の書き戻しも行われない = 恒久的に 0)。
+                //   当エンジンは接線力積を持ち越して適用していた。
+                //   ★これが FRICALIGN と組むと**エネルギーを注ぎ込む**: 摩擦方向は毎フレーム
+                //     相対速度から作り直されるので、前フレームの力積を **別の向き** に再適用してしまう。
+                //     実測 (モデルA・駆動7001F): もみあげの鎖が回り続け、
+                //     毎フレーム変位が 2.6992 の一定値に張り付いた (参照比 19.7)。
+                //   摩擦の向きが幾何基底で安定している FRICALIGN 無しでは表面化しない。
+                if (FrictionVelocityAligned) { c.TangentImpulse1 = 0f; c.TangentImpulse2 = 0f; }
                 // Bullet同様、蓄積インパルスに係数を掛けてから適用+アキュムレータ初期値にする(0.85時)。
                 if (wf != 1.0f) { c.NormalImpulse *= wf; c.TangentImpulse1 *= wf; c.TangentImpulse2 *= wf; }
                 var P = c.Normal * c.NormalImpulse
@@ -1001,7 +1024,8 @@ namespace BulletPhysics
                           c.NormalImpulse, c.TangentImpulse1, c.TangentImpulse2,
                           c.NormalImpulse <= 0f,
                           maxT > 0f && Math.Abs(c.TangentImpulse1) >= maxT * 0.999999f,
-                          relN, c.Friction, maxT, relT, c.TangentMass1));
+                          relN, c.Friction, maxT, relT, c.TangentMass1,
+                          c.Tangent1, c.Normal));
             }
         }
 
