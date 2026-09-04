@@ -241,6 +241,16 @@ namespace Mmd2GltfImporter
             Undo.RecordObject(behaviour, "Configure MmdPhysicsBehaviour");
             behaviour.Source = MmdPhysicsBehaviour.InputSource.Glb;
             behaviour.GlbPath = absPath;
+            // ★ビルド (APK / exe) 対策 (2026-09-04)。
+            //   Unity のビルドには Assets 内の .glb の「ソースファイル」は含まれない。上の絶対パスは
+            //   このマシンにしか存在しないので、ビルドした先 (Android 端末など) では読み込みに失敗し、
+            //   **エディタでは動くのに実機では揺れ物が一切動かない**。
+            //   対策として GLB の JSON チャンク (物理に必要な extras.mmd と nodes/skins が入っている) を
+            //   .mmdphys.bytes として書き出し、コンポーネントから参照させてビルドへ同梱する。
+            //   実行時はこちら (PhysicsData) が GlbPath より優先される。
+            var physicsData = CreatePhysicsDataAsset(glbPath);
+            if (physicsData != null) behaviour.PhysicsData = physicsData;
+            else Debug.LogWarning("[MMD Physics] 物理データ (.mmdphys.bytes) の書き出しに失敗しました。エディタでは動きますが、ビルド (APK 等) では揺れ物が動きません。");
             behaviour.ModelRoot = root.transform; // ボーンTransformは名前でこの配下から解決される
 
             // ── 2) 排他切替コンポーネント ──
@@ -251,7 +261,58 @@ namespace Mmd2GltfImporter
             sw.Mode = MmdPhysicsBackendSwitch.Backend.Custom;
 
             EditorUtility.SetDirty(root);
-            Debug.Log($"[MMD Physics] 自作Bulletエンジンを配線しました。GLB={glbPath}。再生すると extras.mmd から物理を構築してボーンを駆動します（細かい設定は MmdPhysicsBehaviour の Inspector）。");
+            Debug.Log($"[MMD Physics] 自作Bulletエンジンを配線しました。GLB={glbPath}。"
+                + (physicsData != null ? $"物理データ={AssetDatabase.GetAssetPath(physicsData)} (ビルドへ同梱)。" : "")
+                + "再生すると extras.mmd から物理を構築してボーンを駆動します（細かい設定は MmdPhysicsBehaviour の Inspector）。");
+        }
+
+        /// <summary>GLB の JSON チャンクを .mmdphys.bytes として Assets へ書き出し、TextAsset を返す。
+        /// ビルド (APK / exe) には .glb のソースファイルが含まれないため、物理データはこの形で同梱する。
+        /// 中身は元 GLB のバイト列そのまま (再エンコードしない) ので、エディタで .glb を読んだ結果と同一。</summary>
+        private static TextAsset CreatePhysicsDataAsset(string glbAssetPath)
+        {
+            const string dir = "Assets/MmdPhysicsData";
+            try
+            {
+                byte[] json = ExtractGlbJsonChunk(System.IO.Path.GetFullPath(glbAssetPath));
+                if (json == null)
+                {
+                    Debug.LogWarning($"[MMD Physics] {glbAssetPath} から JSON チャンクを取り出せませんでした (GLB ではない?)。");
+                    return null;
+                }
+                if (!AssetDatabase.IsValidFolder(dir)) AssetDatabase.CreateFolder("Assets", "MmdPhysicsData");
+                // 拡張子は .bytes 固定 (Unity はこの拡張子だけを TextAsset として取り込む)。
+                string outPath = $"{dir}/{System.IO.Path.GetFileNameWithoutExtension(glbAssetPath)}.mmdphys.bytes";
+                System.IO.File.WriteAllBytes(outPath, json);
+                AssetDatabase.ImportAsset(outPath, ImportAssetOptions.ForceUpdate);
+                return AssetDatabase.LoadAssetAtPath<TextAsset>(outPath);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[MMD Physics] 物理データの書き出しに失敗: {e.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>GLB コンテナから JSON チャンクのバイト列を取り出す (BIN チャンクは物理に不要なので捨てる)。
+        /// 元の 15〜140MB に対し JSON チャンクは 0.3〜1.7MB 程度。</summary>
+        private static byte[] ExtractGlbJsonChunk(string absGlbPath)
+        {
+            using (var fs = new System.IO.FileStream(absGlbPath, System.IO.FileMode.Open, System.IO.FileAccess.Read))
+            using (var br = new System.IO.BinaryReader(fs))
+            {
+                if (fs.Length < 12 || br.ReadUInt32() != 0x46546C67u) return null; // "glTF"
+                br.ReadUInt32(); // version
+                br.ReadUInt32(); // length
+                while (fs.Position + 8 <= fs.Length)
+                {
+                    uint clen = br.ReadUInt32();
+                    uint ctype = br.ReadUInt32();
+                    if (ctype == 0x4E4F534Au) return br.ReadBytes((int)clen); // "JSON"
+                    fs.Position += clen + ((clen & 3) != 0 ? 4 - (clen & 3) : 0); // 4バイト境界パディング
+                }
+                return null;
+            }
         }
 
         // ★オブジェクト({)を含む配列だけを探す。整数だけの配列(skinのjoints)は飛ばす。

@@ -28,6 +28,14 @@ namespace BulletPhysics.Unity
         [Tooltip("読み込む .glb ファイルのパス (Source=Glb のとき。extras.mmd から剛体/Joint/ボーンを構築)")]
         public string GlbPath = "";
 
+        // ★ビルド (APK / exe) 同梱用の物理データ。**設定されていればパスより優先**する (2026-09-04)。
+        //   Unity のビルドには Assets 内の .glb / .pmx の「ソースファイル」は含まれない。
+        //   GlbPath はエディタで解決した絶対パスなので、Android 端末や配布先の PC には**必ず存在せず**、
+        //   読み込みに失敗して物理が一切動かない (エディタでは動くのに APK では揺れ物が固まる)。
+        //   インポーターの【1】が GLB の JSON チャンクを .mmdphys.bytes として書き出し、ここへ割り当てる。
+        [Tooltip("ビルド(APK/exe)に同梱する物理データ (.mmdphys.bytes)。設定されていれば GlbPath より優先。インポーターの【1】が自動生成して割り当てる")]
+        public TextAsset PhysicsData;
+
         [Tooltip("剛体 BoneIndex -> ボーン Transform のマップ (ボーン名で解決)。GLBは import 済みスケルトンのルート")]
         public Transform ModelRoot;
 
@@ -290,8 +298,24 @@ namespace BulletPhysics.Unity
 
         void Start()
         {
-            if (Source == InputSource.Glb) { if (!string.IsNullOrEmpty(GlbPath)) LoadGlb(GlbPath); }
-            else { if (!string.IsNullOrEmpty(PmxPath)) LoadPmx(PmxPath); }
+            // 入力の解決順: PhysicsData (ビルド同梱) → GlbPath / PmxPath (エディタ専用のファイル読み)。
+            // ★パス経路はエディタ専用と考えること。ビルドにソースファイルは含まれない。
+            if (PhysicsData != null) { LoadPhysicsData(PhysicsData); return; }
+            string path = Source == InputSource.Glb ? GlbPath : PmxPath;
+            if (string.IsNullOrEmpty(path)) return;
+            if (!System.IO.File.Exists(path)) { LogMissingPhysicsData(path); return; }
+            if (Source == InputSource.Glb) LoadGlb(path); else LoadPmx(path);
+        }
+
+        // 「エディタでは動くのにビルドで物理が動かない」を、無言の例外ではなく原因と手順で知らせる。
+        private void LogMissingPhysicsData(string path)
+        {
+            Debug.LogError(
+                $"[MmdPhysics] 物理データを読み込めないため揺れ物は動きません。PhysicsData が未設定で、" +
+                $"参照先 '{path}' もこの環境に存在しません。" +
+                "★ビルド (APK / exe) には .glb / .pmx のソースファイルは含まれず、エディタで解決した絶対パスも" +
+                "端末側には存在しません。Unity で「MMD 物理インポーター」の【1】物理を配線 / 再配線 を実行して " +
+                ".mmdphys.bytes を生成・割り当ててから、ビルドし直してください。");
         }
 
         // PMX 直読み。
@@ -299,17 +323,48 @@ namespace BulletPhysics.Unity
 
         // GLB の extras.mmd 経由。UnitScale は extras.mmd の値を優先する
         // (GLB のメッシュ/スケルトンはその scale で import されているため、表示境界を一致させる必要がある)。
+        // ★エディタ専用の経路 (ファイルを直接読む)。ビルドでは LoadPhysicsData を使う。
         public void LoadGlb(string path)
         {
             var model = GlbPhysicsReader.LoadFile(path, out float unitScale, out var warnings);
-            if (warnings != null)
-                foreach (var w in warnings) Debug.LogWarning($"[MmdPhysics][GLB] {w}");
+            ReportGlbWarnings(warnings);
+            ApplyUnitScale(unitScale);
+            BuildAndInit(model);
+        }
+
+        /// <summary>同梱の物理データ (.mmdphys.bytes) から構築する。**ビルドではこの経路を使う。**
+        /// 中身は元 GLB の JSON チャンクそのものなので、エディタで .glb を直接読んだ結果と同一。</summary>
+        public void LoadPhysicsData(TextAsset asset)
+        {
+            var model = GlbPhysicsReader.LoadBytesAuto(asset.bytes, out float unitScale, out var warnings);
+            ReportGlbWarnings(warnings);
+            ApplyUnitScale(unitScale);
+            BuildAndInit(model);
+        }
+
+        private void ReportGlbWarnings(List<string> warnings)
+        {
+            if (warnings == null) return;
+            foreach (var w in warnings) Debug.LogWarning($"[MmdPhysics][GLB] {w}");
+        }
+
+        // GLB のメッシュ/スケルトンは extras.mmd の scale で import されているため、表示境界を一致させる。
+        private void ApplyUnitScale(float unitScale)
+        {
             if (unitScale > 0f && System.Math.Abs(unitScale - UnitScale) > 1e-6f)
             {
                 Debug.Log($"[MmdPhysics][GLB] UnitScale を extras.mmd の値 {unitScale} に設定 (Inspector {UnitScale} を上書き)");
                 UnitScale = unitScale;
             }
-            BuildAndInit(model);
+        }
+
+        // 診断用 (物理は組まない)。入力の解決順は Start と同じ。
+        private PmxPhysicsModel LoadModelForInspection()
+        {
+            if (PhysicsData != null) return GlbPhysicsReader.LoadBytesAuto(PhysicsData.bytes, out _, out _);
+            if (Source == InputSource.Glb)
+                return string.IsNullOrEmpty(GlbPath) ? null : GlbPhysicsReader.LoadFile(GlbPath, out _, out _);
+            return string.IsNullOrEmpty(PmxPath) ? null : PmxReader.LoadFile(PmxPath);
         }
 
         // 入力経路に依らない共通の初期化 (物理駆動ロジックの共通化)。起動時に FK-rest リセットを必ず呼ぶ。
@@ -519,8 +574,7 @@ namespace BulletPhysics.Unity
             {
                 try
                 {
-                    if (Source == InputSource.Glb) { if (!string.IsNullOrEmpty(GlbPath)) _model = GlbPhysicsReader.LoadFile(GlbPath, out _, out _); }
-                    else if (!string.IsNullOrEmpty(PmxPath)) _model = PmxReader.LoadFile(PmxPath);
+                    _model = LoadModelForInspection();
                 }
                 catch (System.Exception e) { Debug.LogWarning($"[取り込み検査] モデル読込失敗: {e.Message}"); }
             }
@@ -904,8 +958,7 @@ namespace BulletPhysics.Unity
             {
                 try
                 {
-                    if (Source == InputSource.Glb) { if (!string.IsNullOrEmpty(GlbPath)) _model = GlbPhysicsReader.LoadFile(GlbPath, out _, out _); }
-                    else if (!string.IsNullOrEmpty(PmxPath)) _model = PmxReader.LoadFile(PmxPath);
+                    _model = LoadModelForInspection();
                 }
                 catch (System.Exception e) { Debug.LogWarning($"[DumpZ] モデル読込失敗: {e.Message}"); }
             }
@@ -913,7 +966,7 @@ namespace BulletPhysics.Unity
             if (_model != null && ModelRoot != null) ResolveBones();
             if (_model == null || _boneTransforms == null)
             {
-                Debug.LogWarning($"[DumpZ] 初期化不可 (model={( _model==null?"null":"ok")} bones={(_boneTransforms==null?"null":"ok")} ModelRoot={(ModelRoot==null?"未設定":"ok")} Source={Source} GlbPath='{GlbPath}' PmxPath='{PmxPath}')。ModelRootとパスを設定して実行してください。");
+                Debug.LogWarning($"[DumpZ] 初期化不可 (model={( _model==null?"null":"ok")} bones={(_boneTransforms==null?"null":"ok")} ModelRoot={(ModelRoot==null?"未設定":"ok")} Source={Source} PhysicsData={(PhysicsData==null?"未設定":"ok")} GlbPath='{GlbPath}' PmxPath='{PmxPath}')。ModelRootとパスを設定して実行してください。");
                 return;
             }
             // 判定は体側(物理で書き戻されない)ボーンで行う。髪/モミアゲ等は物理書き戻しで鏡像と物理変位が混ざるため除外。

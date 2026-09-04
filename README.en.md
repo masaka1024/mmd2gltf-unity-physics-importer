@@ -170,6 +170,22 @@ truth as well** (https://github.com/masaka1024/mmd2gltf-cs-physics).
 
 Fine-tuning of physics (timestep, penetration handling) lives on the `MmdPhysicsBehaviour` component added by step 1.
 
+### Building a player (APK / exe)
+
+**Always run [1] Wire / Re-wire Physics before you build** — once for every model in the scene.
+
+Step 1 extracts the part of the GLB the physics needs (the JSON chunk: `extras.mmd` plus the bone
+hierarchy), writes it to `Assets/MmdPhysicsData/<model>.mmdphys.bytes`, and assigns it to the
+**`Physics Data`** field of `MmdPhysicsBehaviour`. That asset ships inside the build, so it can be
+read on an Android device. It is 1-3% of the original GLB (0.3-1.7 MB measured). The bytes are the
+original GLB's JSON chunk verbatim, so the result is identical to reading the `.glb` in the editor.
+
+> **Scenes wired before 2026-09-04 must be re-wired.** Earlier versions stored only the absolute
+> path to the `.glb` (`Glb Path`). A Unity build does **not** contain the source `.glb`, and the
+> editor's absolute path does not exist on the device, so **physics works in the editor but nothing
+> moves in the APK**. If you build with an empty `Physics Data`, the player logs an error at runtime
+> explaining the cause and the fix (`adb logcat -s Unity`).
+
 ---
 
 ## Migration from PhysX (2026-08-10)

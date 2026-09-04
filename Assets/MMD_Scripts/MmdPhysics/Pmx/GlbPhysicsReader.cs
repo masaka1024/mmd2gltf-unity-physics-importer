@@ -37,6 +37,33 @@ namespace BulletPhysics.Pmx
             return BuildModel(root, out unitScale, out warnings);
         }
 
+        // ★ビルド同梱データ用の入口 (2026-09-04)。GLB コンテナでも **JSON チャンク単体** でも受ける。
+        //   Unity のビルド (APK / exe) には Assets 内の .glb の「ソースファイル」は含まれないので、
+        //   実行時に File.ReadAllBytes で読むことはできない。インポーターは GLB の JSON チャンク
+        //   (BuildModel が使う extras.mmd と nodes/skins が全部ここに入っている) だけを
+        //   .mmdphys.bytes として書き出し、TextAsset としてビルドへ同梱する。
+        //   JSON チャンクは元 GLB のバイト列そのままなので、エディタで .glb を読んだ結果と同一。
+        public static PmxPhysicsModel LoadBytesAuto(byte[] data, out float unitScale, out List<string> warnings)
+        {
+            if (data == null || data.Length < 4) throw new InvalidDataException("物理データが空です。");
+            if (BitConverter.ToUInt32(data, 0) == 0x46546C67) return LoadBytes(data, out unitScale, out warnings);
+            return LoadJson(Utf8NoBom(data), out unitScale, out warnings);
+        }
+
+        // glTF の JSON チャンク(テキスト)から読む。
+        public static PmxPhysicsModel LoadJson(string json, out float unitScale, out List<string> warnings)
+        {
+            var root = MiniJson.Obj(MiniJson.Parse(json));
+            if (root == null) throw new InvalidDataException("物理データを解釈できません (GLB でも glTF JSON でもない)。");
+            return BuildModel(root, out unitScale, out warnings);
+        }
+
+        private static string Utf8NoBom(byte[] d)
+        {
+            int off = (d.Length >= 3 && d[0] == 0xEF && d[1] == 0xBB && d[2] == 0xBF) ? 3 : 0;
+            return System.Text.Encoding.UTF8.GetString(d, off, d.Length - off);
+        }
+
         // ibm(inverseBindMatrices)から算出した raw PMX ボーン world 位置 (検証の別経路)。
         public static Vec3[] BonePositionsFromIbm(string path)
         {
