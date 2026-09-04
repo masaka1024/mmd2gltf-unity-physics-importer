@@ -360,6 +360,30 @@ namespace Mmd2GltfImporter
                 if (obj is Texture2D t && !texturesByName.ContainsKey(t.name)) texturesByName[t.name] = t;
             }
 
+            // ★UniGLTF の「Extract Materials And Textures ...」を実行すると、Material/Texture2D は
+            //   .glb のサブアセットではなくなり、外部ファイルへ remap される (importer の externalObjects)。
+            //   この状態では上の LoadAllAssetsAtPath が 0件を返し、**全マテリアルが
+            //   「対応するUnity Materialが見つからず」でスキップされる**。
+            //   (Unity 6 で非圧縮 ARGB32 のサブアセットを避けるために抽出が要るので、両立させる)
+            //   キーには remap の SourceAssetIdentifier 側の名前を使う。抽出時にファイル名が
+            //   衝突回避で改名される (例 "__UNIGLTF__DUPLICATED__") ことがあり、
+            //   アセット名では glTF の materials/textures 配列と突き合わせられないため。
+            //   ★抽出していない場合 externalObjects は空なので、従来と完全に同じ動作になる。
+            var glbImporter = AssetImporter.GetAtPath(assetPath);
+            // ★抽出(remap)が有効かどうか。有効なときは .glb が返すサブアセットのテクスチャを信用しない
+            //   (下の FindOrExtractTextureByIndex を参照)。
+            bool hasExtraction = glbImporter != null && glbImporter.GetExternalObjectMap().Count > 0;
+            if (glbImporter != null)
+            {
+                foreach (var kv in glbImporter.GetExternalObjectMap())
+                {
+                    string key = kv.Key.name;
+                    if (string.IsNullOrEmpty(key)) continue;
+                    if (kv.Value is Material em && !materialsByName.ContainsKey(key)) materialsByName[key] = em;
+                    if (kv.Value is Texture2D et && !texturesByName.ContainsKey(key)) texturesByName[key] = et;
+                }
+            }
+
             Texture2D FindTextureByIndex(int texIndex)
             {
                 if (texIndex < 0 || texIndex >= textureNames.Count) return null;
@@ -375,6 +399,15 @@ namespace Mmd2GltfImporter
             Texture2D FindOrExtractTextureByIndex(int texIndex)
             {
                 var existing = FindTextureByIndex(texIndex);
+                // ★UniGLTF の Extract を掛けると、remap されたテクスチャについても
+                //   AssetDatabase.LoadAllAssetsAtPath(.glb) は Texture2D を返してくるが、
+                //   **その実体は既に無い(ダングリング)**。代入するとマテリアルが真っ白になる。
+                //   抽出が有効なときは .glb 所有のサブアセットを信用せず、GLBバイナリから取り直す。
+                //   実測: 抽出済みの11枚だけが白くなり、未抽出のものは元からバイナリ経路に
+                //   落ちていたため無事だった (2026-08-25 の診断ログで確定)。
+                //   ★抽出していない場合 hasExtraction=false なので、従来と完全に同じ動作。
+                if (existing != null && hasExtraction
+                    && AssetDatabase.GetAssetPath(existing) == assetPath) existing = null;
                 if (existing != null) return existing;
                 return ExtractTextureFromGlb(texIndex, assetPath);
             }
@@ -442,7 +475,7 @@ namespace Mmd2GltfImporter
                 //   付き、全員がTransparent(q3000)へ昇格してしまう。透明キュー内は
                 //   サブメッシュ番号順+深度書き込み(TwoPass)で描画されるため、
                 //   「前髪(若い番号)の向こう側にあるメガネ(大きい番号)が深度テストに
-                //   落ちて消える」症状が起きる(V4Xで実測確認)。
+                //   落ちて消える」症状が起きる(モデルBで実測確認)。
                 //   対策：
                 //   ・mask由来の昇格組(見た目ほぼ不透明) → AlphaTest帯(2452+slot)。
                 //     深度を書きつつ真の半透明より先に描画されるので、透け髪や
@@ -464,7 +497,12 @@ namespace Mmd2GltfImporter
 
                     if (md.pbrMetallicRoughness.baseColorTexture != null)
                     {
-                        var tex = FindTextureByIndex(md.pbrMetallicRoughness.baseColorTexture.index);
+                        // ★FindOrExtract を使う (素の FindTextureByIndex ではない)。
+                        //   ベースカラーは「標準マテリアルから参照されるので必ずサブアセットにある」
+                        //   という前提で素の方を使っていたが、UniGLTF の Extract を掛けると
+                        //   サブアセットが無くなりこの前提が崩れる。トゥーン/スフィア/orig と
+                        //   同じくGLBバイナリ直読みのフォールバックに乗せる。
+                        var tex = FindOrExtractTextureByIndex(md.pbrMetallicRoughness.baseColorTexture.index);
                         if (tex != null) mat.SetTexture("_MainTex", tex);
                     }
                 }
