@@ -66,12 +66,86 @@ namespace BulletPhysics.Unity
         [Tooltip("ONで Time.fixedDeltaTime を FixedTimeStep に合わせる (毎FixedUpdate=1ステップ=等間隔)。Unity全体の物理刻みを変える点に注意")]
         public bool AlignUnityFixedTimestep = true;
 
+        // ★2026-08-25 (タスク84): 描画が重いモデルで髪/スカートが暴れる件の対策。
+        // 症状: 重いモデルで描画fpsが落ちると揺れ物が発散して見える。
+        // 原因: Animator の既定 (updateMode = Normal) は **レンダフレームに1回**しかボーンを書かないが、
+        //   FixedUpdate は Time.fixedDeltaTime (整列後 60Hz) で回る。描画が 10fps まで落ちると
+        //   6回の FixedUpdate のうち **5回はボーン差分ゼロ**、残り1回が 100ms 分のジャンプをまとめて受ける。
+        //   キネマティック速度は (目標 - 現在) / dt (PhysicsWorld.IntegrateVelocities) なので、
+        //   **その1ステップだけ実速度の6倍のキック**が揺れ物へ叩き込まれる。
+        // 実測 (SynDrive の HOLD=N = 駆動目標を N フレームに1回しか更新しない = 描画 60/N fps 相当):
+        //     HOLD  1 (60fps) : |w|中央  40.5 / |Δp|p90 0.164
+        //     HOLD  4 (15fps) :         326.7 /          0.832
+        //     HOLD 10 ( 6fps) :         588.4 /          3.284   ← |w| 14.5倍・|Δp| 20倍
+        //   NaN は 0件。数値破綻ではなく「毎秒15回転級の暴れ」で、画面上は発散に見える。
+        //   ★モデル固有ではない。対照2モデルでも 4.3倍 / 16.7倍 になる = 配線の性質。
+        // 対策: updateMode を Fixed にすると Animator が FixedUpdate 側で評価され、ボーンは
+        //   描画fpsに依らず 60Hz で進む = HOLD=1 の条件に戻る。読み取り順が Animator 評価の
+        //   前後どちらでも **定数1ステップの遅れ**になるだけで、N ステップ保持は消える。
+        // ★Unity 2023.1 で AnimatorUpdateMode.AnimatePhysics は Fixed へ改名 (当プロジェクトは Unity 6)。
+        //   同時に旧 AnimatePhysics の役割が2つに分割された:
+        //     updateMode = Fixed        … FixedUpdate 側で評価する ← **必要なのはこちら**
+        //     Animator.animatePhysics   … Transform 変更を PhysX へ同期する
+        //   当エンジンは Transform を直接読む (PhysX コライダを介さない) ので後者は不要。立てない。
+        // ★既定ON。OFF にすると Unity の既定 (Normal) のまま = 従来挙動。
+        [Tooltip("ONで Animator の updateMode を Fixed(旧 AnimatePhysics) にする。ボーン更新を描画fpsから切り離し、描画が重いときに揺れ物が暴れるのを防ぐ")]
+        public bool AnimateInFixedUpdate = true;
+        [Tooltip("Animator を自動検出できないときに手で指定する (空なら 自分→親 / ModelRoot→親→子 / 自分の子 の順で探す)")]
+        public Animator TargetAnimator;
+
+        // ★2026-08-26 (タスク90): 重いモデルで FPS が落ちたとき、物理コストが雪だるま式に増える件の対策。
+        // 症状: 描画が重い ⇒ 1描画フレームあたりの FixedUpdate 回数が増える ⇒ 物理が何度も回る
+        //       ⇒ さらに重くなる、という**正のフィードバック**。
+        // 機構: Unity は遅れを取り戻すため 1描画フレームで FixedUpdate を
+        //       `Time.maximumDeltaTime / Time.fixedDeltaTime` 回まで呼ぶ。既定は 0.3333/0.0167 = **20回**。
+        // 実測 (TimingDiag・606剛体のモデル): 1描画フレームあたりの FixedUpdate が
+        //       1 → 4 → 4 → 8 と増えていくのを確認。3FPS では上限の 20回に張り付く。
+        //       物理 3.5ms/ステップ × 20 = 70ms/フレームが物理だけで乗る。
+        //       `Time.maximumDeltaTime` を 0.05 (=最大3回) に下げると FPS が改善することを実機で確認。
+        // 副作用: 重いフレームでは物理が実時間より遅れる (スローモーションになる)。破綻はしない。
+        //       Time.deltaTime も同じ値でクランプされるので、他の毎フレーム処理にも効く点は留意。
+        // ★軽いモデルではそもそも追いつきが発生しないので無影響。
+        [Tooltip("ONで Time.maximumDeltaTime を下げ、重いフレームでの FixedUpdate 追いつき回数を制限する (物理コストの雪だるまを防ぐ)")]
+        public bool LimitFixedUpdateCatchUp = true;
+
+        // ===================================================================
+        // シーン単位で動的剛体の質量に上限を掛ける。**0 = 無効 (既定・ビット不変)。**
+        //
+        // ★2026-08-27 タスク84: **採用根拠だった数値はすべて撤回した。**
+        //   根拠にしていた参照データ (揺れ物の比較対象) が全期間を通じて無効だったため。
+        //   したがって「忠実度19倍/15倍を代償」「撤去条件=定常2.2°維持」も**削除**。
+        //
+        //   現状: **暫定策の定量的な根拠は無い。** 要否は実機の目視でのみ判断すること。
+        //   フィールド自体は無害 (既定 0 で未適用) なので残す。
+        // ===================================================================
+        [Tooltip("このシーンでだけ動的剛体の質量に上限を掛ける (0=無効)。定量的な根拠は無い。要否は実機の目視で判断すること")]
+        public float SceneMaxDynamicMass = 0f;
+
+        // ★2026-08-26 (タスク92): 実機の発散をヘッドレスで再現するためのモーション吸い出し。
+        //   Play 中、物理が読むのと同じタイミング (FixedUpdate の Push 直前) で、
+        //   BoneFollow 剛体が参照するボーンのワールド姿勢を CSV へ記録する。
+        //   ★エンジン境界の変換 (UnityToMmdPos/Rot) をそのまま使うので、座標系の取り違えが起きない。
+        //   形式は BonePoseCsvSource / BoneCheck.BoneCsv と同一:
+        //     frame,boneName,posX,posY,posZ,quatX,quatY,quatZ,quatW  (PMX ネイティブ)
+        //   既定OFF。診断用なので通常運用では触らない。
+        [Header("Diagnostics")]
+        [Tooltip("Play中、駆動ボーンのワールド姿勢をCSVへ記録する (ヘッドレス再現用)。指定フレーム数で自動停止")]
+        public bool DumpBonePoseCsv = false;
+        [Tooltip("記録するFixedUpdate数")]
+        public int DumpFrames = 3000;
+        [Tooltip("記録を始めるまでに捨てるFixedUpdate数 (起動直後ではなくダンス中を採りたいとき)")]
+        public int DumpSkipFrames = 0;
+        [Tooltip("出力先 (空ならプロジェクト直下 bonepose_dump.csv)")]
+        public string DumpCsvPath = "";
+        [Tooltip("上をONにしたときの Time.maximumDeltaTime。0.05 で 1描画フレームあたり最大3回 (60Hz時)")]
+        public float MaxAllowedTimestep = 0.05f;
+
         [Header("Jitter (静止時の細かい振動)")]
         // ★静止しているのに揺れ物が細かく震える件の対策 (2026-08-10 調査)。
         //   原因: 拘束の位置誤差(Baumgarte)を「実速度」として打ち消しているため、毎ステップ
         //   運動エネルギーが供給され続け、静止状態に落ち着かない。
         //   split impulse は位置補正を擬似速度側へ分離し、実速度を汚さない標準的な対策。
-        //   実測(IA・静止10秒後・動的剛体の残留運動の平均):
+        //   実測(モデルA・静止10秒後・動的剛体の残留運動の平均):
         //     既定           |v|0.793 |w|1.367
         //     ジョイントのみ |v|0.690 |w|1.188
         //     接触のみ       |v|0.714 |w|1.314
@@ -84,9 +158,9 @@ namespace BulletPhysics.Unity
         public bool ContactSplitImpulse = false;
 
         // Bullet のスリープ(非活性化)。静止した剛体を計算から外す。MMDは有効
-        // (ユーザー実機でMMDのIAの序盤=静止ポーズ中に髪の揺れが止まることを確認)。
+        // (ユーザー実機でMMDのモデルAの序盤=静止ポーズ中に髪の揺れが止まることを確認)。
         // ★既定OFF: 実装済みだが現状ほとんど発動しない。当エンジンの静止時の残留運動が
-        //   Bullet のしきい値を超えているため (IA |w|平均1.5 > しきい値1.0、101体中2体しか眠らない)。
+        //   Bullet のしきい値を超えているため (モデルA |w|平均1.5 > しきい値1.0、101体中2体しか眠らない)。
         //   残留を下げるのが先。しきい値を緩めれば眠るが、動くべき揺れ物が固まる危険がある。
         [Tooltip("静止した剛体を非活性化して計算から外す(Bullet相当)。現状ほとんど発動しないため既定OFF")]
         public bool EnableSleeping = false;
@@ -125,7 +199,7 @@ namespace BulletPhysics.Unity
         //   mode2 剛体は「位置はボーン階層から、回転は物理から」がMMDの仕様。従来これが未実装で
         //   mode1 と同じ完全自由になっていたため、スカートがMMDより柔らかかった
         //   (モデルB はスカート66個中32個が mode2。実測で揺れ幅 0.257→0.188)。
-        //   既定ON。mode2 剛体を持たないモデル(IA等)では何もしないので無影響。
+        //   既定ON。mode2 剛体を持たないモデル(モデルA等)では何もしないので無影響。
         //   OFF にすると従来どおり mode2 を mode1 と同じ扱いにする (A/B 比較用)。
         [Tooltip("PMX mode2(物理演算+ボーン位置合わせ)を再現する。OFFで従来どおりmode1と同一扱い")]
         public bool EnableBoneMergeMode = true;
@@ -242,6 +316,8 @@ namespace BulletPhysics.Unity
         private void BuildAndInit(PmxPhysicsModel model)
         {
             _model = model;
+            // ★シーン側の明示設定を Build の直前に反映する (エンジン既定 0 は触らない)。
+            PmxPhysicsBuilder.MaxDynamicMass = SceneMaxDynamicMass;
             _builder = PmxPhysicsBuilder.Build(_model);
             _builder.World.Gravity = new Vec3(0f, -Gravity, 0f);
             _builder.World.SolverIterations = SolverIterations;
@@ -259,6 +335,124 @@ namespace BulletPhysics.Unity
             // リセットはバインド基準なので、LateUpdate で posed 姿勢へ再整合し直す予約を入れる。
             _startupResetCountdown = PoseResetDelayFrames > 0 ? PoseResetDelayFrames : 0;
             CheckTimestepAlignment();
+            AlignAnimatorUpdateMode();
+            LimitCatchUp();
+        }
+
+        /// <summary>重いフレームで FixedUpdate が何度も走り、物理コストが雪だるま式に増えるのを抑える。
+        /// 理由と実測は <see cref="LimitFixedUpdateCatchUp"/> の注記を参照。</summary>
+        public void LimitCatchUp()
+        {
+            if (!LimitFixedUpdateCatchUp) return;
+            if (MaxAllowedTimestep <= 0f) return;
+            if (Time.maximumDeltaTime <= MaxAllowedTimestep)
+            {
+                Debug.Log($"[MmdPhysics] Time.maximumDeltaTime は既に {Time.maximumDeltaTime:F4} " +
+                          $"({MaxAllowedTimestep:F4} 以下) なので変更しません。");
+                return;
+            }
+            float before = Time.maximumDeltaTime;
+            Time.maximumDeltaTime = MaxAllowedTimestep;
+            Debug.Log($"[MmdPhysics] Time.maximumDeltaTime を {before:F4} -> {MaxAllowedTimestep:F4} に下げました " +
+                      $"(1描画フレームあたりの FixedUpdate を最大 {Mathf_Round(MaxAllowedTimestep / Time.fixedDeltaTime)} 回に制限)。" +
+                      "重いフレームでの物理コストの雪だるまを防ぎます。OFF にするには LimitFixedUpdateCatchUp を切ってください。");
+        }
+
+        /// <summary>Animator のボーン更新を FixedUpdate 側へ移し、描画fpsから切り離す。
+        /// 起動時に1度呼ぶ。Animator を後から差し替えたときは手で呼び直せる。
+        /// 理由と実測は <see cref="AnimateInFixedUpdate"/> の注記を参照。</summary>
+        public void AlignAnimatorUpdateMode()
+        {
+            if (!AnimateInFixedUpdate)
+            {
+                Debug.Log("[MmdPhysics] AnimateInFixedUpdate が OFF のため Animator.updateMode は変更しません " +
+                          "(描画fpsが落ちると揺れ物が暴れます)。");
+                return;
+            }
+            var anim = FindAnimator();
+            if (anim == null)
+            {
+                // ★2026-08-26: 実機は Animator ではなく **レガシーの Animation コンポーネント**だった。
+                //   glTF/VMD 経由の構成では珍しくない。列挙型も別名なので注意:
+                //     Animator  : AnimatorUpdateMode.Fixed          (旧 AnimatePhysics)
+                //     Animation : AnimationUpdateMode.Fixed  ★列挙子は Normal と Fixed の2つだけ
+                //   ★列挙子名を推測しないこと。実際に UnityEngine.AnimationModule.dll の
+                //     メタデータを読んで確認した:
+                //       AnimatorUpdateMode  = Normal, Fixed, UnscaledTime, AnimatePhysics
+                //       AnimationUpdateMode = Normal, Fixed
+                var legacy = FindLegacyAnimation();
+                if (legacy != null)
+                {
+                    if (legacy.updateMode == AnimationUpdateMode.Fixed)
+                    {
+                        Debug.Log($"[MmdPhysics] Animation(レガシー) '{legacy.name}' は既に " +
+                                  "updateMode=Fixed です (変更不要)。");
+                        return;
+                    }
+                    var wasLegacy = legacy.updateMode;
+                    legacy.updateMode = AnimationUpdateMode.Fixed;
+                    Debug.Log($"[MmdPhysics] Animation(レガシー) '{legacy.name}' の updateMode を " +
+                              $"{wasLegacy} -> Fixed に変更しました " +
+                              $"(ボーン更新を FixedUpdate={Time.fixedDeltaTime:F5}s へ移し、描画fpsから切り離す)。" +
+                              "描画が重いときに髪/スカートが暴れるのを防ぎます。");
+                    return;
+                }
+
+                // ★黙って通さない。「見つからなかった」のか「適用済み」なのかを
+                //   ログだけで区別できないと、実機の切り分けができない (2026-08-26 に実際に詰まった)。
+                Debug.LogWarning("[MmdPhysics] Animator も Animation(レガシー) も見つからないため updateMode を変更できません。" +
+                                 "描画fpsが落ちると揺れ物が暴れます。" +
+                                 $"探索範囲: 自分('{name}')→親 / ModelRoot(" +
+                                 (ModelRoot != null ? $"'{ModelRoot.name}'" : "未設定") + ")→親→子 / 自分の子。" +
+                                 "見つからない場合は Inspector の TargetAnimator に直接割り当ててください。");
+                return;
+            }
+            if (anim.updateMode == AnimatorUpdateMode.Fixed)
+            {
+                Debug.Log($"[MmdPhysics] Animator '{anim.name}' は既に updateMode=Fixed です (変更不要)。");
+                return;
+            }
+            var before = anim.updateMode;
+            anim.updateMode = AnimatorUpdateMode.Fixed;
+            Debug.Log($"[MmdPhysics] Animator.updateMode を {before} -> Fixed に変更しました " +
+                      $"(ボーン更新を FixedUpdate={Time.fixedDeltaTime:F5}s へ移し、描画fpsから切り離す)。" +
+                      "描画が重いときに髪/スカートが暴れるのを防ぎます。従来挙動に戻すには AnimateInFixedUpdate を OFF。");
+        }
+
+        // Animator は通常このコンポーネントと同じルートに付く (インポーターが prefab ルートへ
+        // AddComponent するため)。ただし手で組んだシーンでは別の階層に居ることがある。
+        // ★2026-08-26: 実機で「見つからない」が発生した。原因は探索範囲が狭かったこと:
+        //   (1) ModelRoot の **子** を見ていなかった (Animator がスケルトン側に付く構成)
+        //   (2) 非アクティブな GameObject を除外する既定のオーバーロードを使っていた
+        //   両方を直し、最後の手段として TargetAnimator で手指定できるようにした。
+        private Animator FindAnimator()
+        {
+            if (TargetAnimator != null) return TargetAnimator;
+            var a = GetComponentInParent<Animator>(true);
+            if (a != null) return a;
+            if (ModelRoot != null)
+            {
+                a = ModelRoot.GetComponentInParent<Animator>(true);
+                if (a != null) return a;
+                a = ModelRoot.GetComponentInChildren<Animator>(true);
+                if (a != null) return a;
+            }
+            return GetComponentInChildren<Animator>(true);
+        }
+
+        // Animator と同じ探索を、レガシーの Animation コンポーネントに対しても行う。
+        private Animation FindLegacyAnimation()
+        {
+            var a = GetComponentInParent<Animation>(true);
+            if (a != null) return a;
+            if (ModelRoot != null)
+            {
+                a = ModelRoot.GetComponentInParent<Animation>(true);
+                if (a != null) return a;
+                a = ModelRoot.GetComponentInChildren<Animation>(true);
+                if (a != null) return a;
+            }
+            return GetComponentInChildren<Animation>(true);
         }
 
         // 物理刻みと Unity の FixedUpdate 間隔が食い違うと、内部ステップが実時間で不均一になり
@@ -438,8 +632,35 @@ namespace BulletPhysics.Unity
             // --- TimingDiag: FixedUpdate = 物理が見るボーン姿勢 (このフレームのPush前)。 ---
             if (_diagLeft > 0 && _diagTr != null && _diagFixedCount == 0) _diagFixedPos = _diagTr.position;
 
+            // ★診断: 物理が読むのと同じ姿勢を記録する (Push の直前)。
+            if (DumpBonePoseCsv) DumpBonePoseFrame();
+
+            // ★アニメのフレーム0→1・ループ境界・シークで骨格が飛んだら、殴られる前に置き直す。
+            //   判定は **Push の前** (KinematicTarget がまだ前フレームの値のうち) でなければならない。
+            //   実測 (タスク93): あるモデルの frame0→1 で駆動ボーン20本すべてが 8〜10単位 飛び、
+            //   検出なしだと次の1ステップで |v| 690 / |w| 52,679deg/s、拘束違反 0.018→7.7 へ爆発した。
+            //   検出して再整合すると違反は 0.08 に収まり、接触数も約300→約170へ半減する。
+            bool teleported = DetectBoneTeleport();
+
             // 1. ボーン追従剛体に目標姿勢を渡す (物理前)。
             PushBonesToKinematic();
+
+            // 2. 飛んでいたら **ステップ前に** 置き直す。ここを Step の後にすると意味がない。
+            //    併せて起動時と同じ「数フレームかけて整合させる」経路にも載せる (LateUpdate 側)。
+            if (teleported)
+            {
+                ResetPhysicsToBones();
+                _startupResetCountdown = PoseResetDelayFrames > 0 ? PoseResetDelayFrames : 1;
+                // ★発火したことを必ず残す。黙って動く対策は「効いていない」ことに気づけない
+                //   (2026-08-26 に updateMode の件で実際に踏んだ)。連発時はうるさいので上限つき。
+                if (_teleportLogged < 20)
+                {
+                    _teleportLogged++;
+                    Debug.Log($"[MmdPhysics] ボーンのテレポートを検出 (駆動ボーン {_teleportOver}/{_teleportTotal} 本が " +
+                              $"{TeleportResetThreshold} を超えて移動) → ステップ前に物理を再整合しました。" +
+                              (_teleportLogged == 20 ? " ※以後このログは省略します。" : ""));
+                }
+            }
 
 
             // 2. 物理ステップ。
@@ -452,7 +673,7 @@ namespace BulletPhysics.Unity
             //      FixedUpdate で書いた物理姿勢は、そのボーンにカーブがあると Animator に必ず潰される。
             //      症状: クリップがスカート/髪のカーブ(レストポーズの定数キーでも可)を持つモデルで、
             //      再生1フレーム目から揺れ物がレストポーズのまま固定される(モデルEで発現)。
-            //      IA は本体のみベイクで揺れ物カーブが無いため表面化していなかった。
+            //      モデルA は本体のみベイクで揺れ物カーブが無いため表面化していなかった。
         }
 
         // 起動直後の数フレームだけ、アニメが確定させた「フレーム0姿勢」に対して物理を再整合する。
@@ -485,26 +706,11 @@ namespace BulletPhysics.Unity
 
             if (_builder == null) return;
 
-            // アニメのループ境界/巻き戻し/シークで骨格が飛んだら、起動時の再整合を張り直す。
-            // (判定は再整合そのものより前に置く。飛んだフレームの物理を捨てるのではなく、
-            //  起動時と同じ「数フレームかけて整合させる」経路へ載せる。)
-            if (_startupResetCountdown <= 0 && TeleportResetThreshold > 0f)
-            {
-                float th2 = TeleportResetThreshold * TeleportResetThreshold;
-                int over = 0, total = 0;
-                foreach (var link in _builder.BoneLinks)
-                {
-                    if (link.Mode != PhysicsMode.BoneFollow || link.BoneIndex < 0) continue;
-                    var bw = BoneWorldOrNull(link.BoneIndex);
-                    if (!bw.HasValue) continue;
-                    total++;
-                    var d = (bw.Value * link.BodyOffsetFromBone).Origin - link.Body.KinematicTarget.Origin;
-                    if (d.LengthSquared > th2) over++;
-                }
-                int need = System.Math.Max(1, (int)System.Math.Ceiling(total * TeleportResetMinFraction));
-                if (over >= need && over > 0)
-                    _startupResetCountdown = PoseResetDelayFrames > 0 ? PoseResetDelayFrames : 1;
-            }
+            // ★テレポート検出は FixedUpdate へ移した (2026-08-26 / タスク93)。ここには置かない。
+            //   理由: 判定式が KinematicTarget と比べるが、その値は **同じフレームの FixedUpdate で
+            //   PushBonesToKinematic が既に新しい姿勢へ更新済み**。LateUpdate では常に差≈0 になり、
+            //   検出が一度も発火しなかった。しかも物理ステップは FixedUpdate なので、
+            //   ここで気づいても **既に殴られた後**である。
 
             // 起動直後: アニメがフレーム0を適用した後の posed 骨格へ物理を再整合する。
             if (_startupResetCountdown > 0)
@@ -521,11 +727,85 @@ namespace BulletPhysics.Unity
             PullPhysicsToBones();
         }
 
+        /// <summary>駆動ボーンが1フレームで大きく飛んだか (アニメのフレーム0→1・ループ境界・シーク)。
+        /// ★必ず PushBonesToKinematic の **前** に呼ぶこと。KinematicTarget が前フレームの値である
+        /// ことが判定の前提で、Push の後に呼ぶと差が常に 0 になり検出できない。</summary>
+        private bool DetectBoneTeleport()
+        {
+            if (_builder == null || TeleportResetThreshold <= 0f) return false;
+            if (_startupResetCountdown > 0) return false;   // 既に整合中なら二重に張らない
+            float th2 = TeleportResetThreshold * TeleportResetThreshold;
+            int over = 0, total = 0;
+            foreach (var link in _builder.BoneLinks)
+            {
+                if (link.Mode != PhysicsMode.BoneFollow || link.BoneIndex < 0) continue;
+                var bw = BoneWorldOrNull(link.BoneIndex);
+                if (!bw.HasValue) continue;
+                total++;
+                var d = (bw.Value * link.BodyOffsetFromBone).Origin - link.Body.KinematicTarget.Origin;
+                if (d.LengthSquared > th2) over++;
+            }
+            int need = System.Math.Max(1, (int)System.Math.Ceiling(total * TeleportResetMinFraction));
+            _teleportOver = over; _teleportTotal = total;
+            return over >= need && over > 0;
+        }
+        private int _teleportOver, _teleportTotal, _teleportLogged;
+
         private void PushBonesToKinematic()
         {
             // 駆動式は共通ヘルパに集約 (2026-08-09 hairfid誤配置事故の再発防止)。
             // 旧実装は未解決ボーンで Identity フォールバック=原点へテレポートし得た。ヘルパは null=前回維持で安全。
             _builder.ApplyKinematicTargets(BoneWorldOrNull);
+        }
+
+        // ─── ボーン姿勢CSVダンプ (診断) ───────────────────────────────────────
+        private System.Text.StringBuilder _dumpSb;
+        private int _dumpFrame, _dumpSkipped;
+        private int[] _dumpBoneIdx;
+
+        private void DumpBonePoseFrame()
+        {
+            if (_builder == null) return;
+            if (_dumpSb == null)
+            {
+                // 駆動に必要なボーン = BoneFollow 剛体が参照しているボーンだけ。
+                // 全ボーン(数百)を出すとCSVが無駄に肥大するので絞る。
+                var set = new System.Collections.Generic.SortedSet<int>();
+                foreach (var link in _builder.BoneLinks)
+                    if (link.Mode == PhysicsMode.BoneFollow && link.BoneIndex >= 0) set.Add(link.BoneIndex);
+                _dumpBoneIdx = new int[set.Count];
+                set.CopyTo(_dumpBoneIdx);
+                _dumpSb = new System.Text.StringBuilder(1 << 20);
+                _dumpSb.Append("frame,boneName,posX,posY,posZ,quatX,quatY,quatZ,quatW\n");
+                Debug.Log($"[MmdPhysics][Dump] 開始: 駆動ボーン {_dumpBoneIdx.Length} 本 x {DumpFrames} フレーム");
+            }
+            if (_dumpSkipped < DumpSkipFrames) { _dumpSkipped++; return; }
+            if (_dumpFrame >= DumpFrames) return;
+
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            foreach (int bi in _dumpBoneIdx)
+            {
+                var w = BoneWorldOrNull(bi);   // ★エンジン境界の変換を再利用 (座標系の取り違え防止)
+                if (!w.HasValue) continue;
+                var t = w.Value; var p = t.Origin; var q = t.Rotation;
+                _dumpSb.Append(_dumpFrame.ToString(ci)).Append(',')
+                       .Append(_model.BoneNames[bi]).Append(',')
+                       .Append(p.x.ToString("R", ci)).Append(',').Append(p.y.ToString("R", ci)).Append(',').Append(p.z.ToString("R", ci)).Append(',')
+                       .Append(q.x.ToString("R", ci)).Append(',').Append(q.y.ToString("R", ci)).Append(',').Append(q.z.ToString("R", ci)).Append(',').Append(q.w.ToString("R", ci))
+                       .Append('\n');
+            }
+            _dumpFrame++;
+            if (_dumpFrame >= DumpFrames)
+            {
+                string path = string.IsNullOrEmpty(DumpCsvPath) ? "bonepose_dump.csv" : DumpCsvPath;
+                try
+                {
+                    System.IO.File.WriteAllText(path, _dumpSb.ToString(), new System.Text.UTF8Encoding(false));
+                    Debug.Log($"[MmdPhysics][Dump] 完了: '{System.IO.Path.GetFullPath(path)}' へ {_dumpFrame} フレーム書き出しました。");
+                }
+                catch (System.Exception e) { Debug.LogError($"[MmdPhysics][Dump] 書き出し失敗: {e.Message}"); }
+                DumpBonePoseCsv = false;
+            }
         }
 
         private void PullPhysicsToBones()

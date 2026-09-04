@@ -56,7 +56,7 @@ namespace BulletPhysics.Pmx
                 };
                 body.KinematicTarget = body.WorldTransform;
                 // ボーン追従は質量 0 (kinematic)、それ以外は PMX 質量。
-                body.SetMassProps(body.Mode == PhysicsMode.BoneFollow ? 0f : rb.Mass);
+                body.SetMassProps(body.Mode == PhysicsMode.BoneFollow ? 0f : ClampMass(rb.Mass, rb.Name));
 
                 World.AddBody(body);
                 Bodies.Add(body);
@@ -165,6 +165,56 @@ namespace BulletPhysics.Pmx
         ///  全simが走って貫入系の数字が全て汚染された。再発防止のため集約+回帰テストあり)
         /// getDrivenBoneWorld が null を返したボーンは前回ターゲット維持 (テレポートしない)。
         /// </summary>
+        /// <summary>PMX の異常な質量を、float32 のソルバが壊れない範囲へ丸める。
+        /// ★2026-08-26 (タスク94)。減衰の [0,0.999] クランプと同じ「異常値への耐性」の一環。
+        ///
+        /// 背景 (すべて実測):
+        ///   あるモデルは 34リンクの鎖に **質量 5.56e14 → 0.1 (毎段 ÷3)** を持つ。
+        ///   実機の再生でこの鎖が発散し、画面外まで飛んだ。ヘッドレス再現 (tools/diagnostics/divhunt)
+        ///   で切り分けたところ:
+        ///     ・接触を止めても**完全に同一** → 接触は無関係。ジョイントソルバ由来
+        ///     ・反復 10/20/40・サブステップ 2/4 で**変わらない** → 収束不足ではない
+        ///     ・減衰 0.1/0.5/0.9 に変えても**変わらない** → 減衰は無関係
+        ///     ・発散の瞬間の入力は **0.03単位 / 1.3度** → 入力は穏やか
+        ///     ・**質量に上限を掛けると完全に発散しない**
+        ///   上限の掃引: **1e11 までは無事、1e12 から発散**する。float32 の限界域。
+        ///
+        /// 閾値 1e3 の根拠 (実測で選んだ。単なる余裕取りではない):
+        ///   ・参照スイート35モデルの動的質量の最大は **30**。1e3 はその **33倍**で、
+        ///     全モデルで一度も発動しない (36モデルスイープはビット同一)。
+        ///   ・上限を上げすぎると効かない。**1e6 では静止時の拘束違反が 1.5** と悪化する
+        ///     (質量 1e14 で「凍って」いた鎖の拘束が解け、不安定な領域に留まるため)。
+        ///     1e3 なら **0.196**、1e2 で 0.204。1e3〜1e2 が実測の最良域。
+        ///   ・不安定域 (1e12) からは 9桁下。
+        ///   1e14 の剛体を 1e3 に丸めても、鎖の末端 (0.1) との比は 1e4 なので
+        ///   「事実上動かない」という作者の意図は保たれる。
+        /// ★動的剛体だけが対象。ボーン追従 (mode 0) は元から質量 0 なので影響しない。
+        ///
+        /// ★Bullet 2.75 にこのクランプは無い。**忠実化ではなく耐性のための逸脱**である。
+        ///   参照スイートでは一度も発動しないので、平時の出力はビット不変。
+        /// </summary>
+        /// ★★2026-08-26 (タスク96) 既定を 0 (無効) へ戻した。**実害が出るまで 0 のまま。**
+        ///
+        /// ★2026-08-27 タスク84: ここに書いてあった参照比の数値 (定常/スパイクの倍率) は
+        ///   **すべて撤回した**。突き合わせに使った参照データが全期間を通じて無効だったため
+        ///   (経緯は docs/investigations の該当モデルの参照の件)。
+        ///   撤回しない事実だけ残す:
+        ///   ・導入時に自前の |v| しきい値だけで採否を判定していたのは誤りだった。
+        ///   ・安定性のためにクランプが要るわけではない
+        ///     (全身・接触あり・3600F で |p|max 48.7・発散なし。参照非依存の実測)。
+        ///   ・実機で「画面外へ飛ぶ」のを止めたのは **起動時テレポートの修正** (タスク93) の方。
+        ///   → クランプの要否には現状 **定量的な根拠が無い**。既定 0 を維持する。
+        public static float MaxDynamicMass = 0f;   // ★2026-08-26 タスク96: 既定 OFF へ戻した (下記)
+        public static int ClampedMassCount;   // 診断用: 何体丸めたか
+
+        private static float ClampMass(float mass, string name)
+        {
+            if (MaxDynamicMass <= 0f) return mass;          // 0 で無効化 (A/B 用)
+            if (!(mass > MaxDynamicMass)) return mass;      // NaN はここを通さない (下の判定へ)
+            ClampedMassCount++;
+            return MaxDynamicMass;
+        }
+
         public void ApplyKinematicTargets(System.Func<int, RigidTransform?> getDrivenBoneWorld)
         {
             foreach (var link in BoneLinks)
