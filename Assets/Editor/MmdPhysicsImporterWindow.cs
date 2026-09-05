@@ -853,10 +853,24 @@ namespace Mmd2GltfImporter
             if (!string.IsNullOrEmpty(img.mimeType) && img.mimeType.Contains("jpeg")) ext = ".jpg";
 
             string parentFolder = Path.GetDirectoryName(assetPath).Replace("\\", "/");
-            string folder = parentFolder + "/MMD_ExtractedTextures";
-            if (!AssetDatabase.IsValidFolder(folder))
+            string rootFolder = parentFolder + "/MMD_ExtractedTextures";
+            if (!AssetDatabase.IsValidFolder(rootFolder))
             {
                 AssetDatabase.CreateFolder(parentFolder, "MMD_ExtractedTextures");
+            }
+
+            // ★抽出先は .glb ごとに分ける。フォルダを共有すると、同名のテクスチャを持つ別モデルを
+            //   同じ階層に置いたときに後勝ちで上書きされ、先のモデルのマテリアルが別モデルの
+            //   テクスチャを指してしまう。MMDは「顔.png」「体.png」のような汎用名が多く、
+            //   img.name が空なら "tex_0" になるので確実に衝突する。
+            //   ★2026-09-06：hasExtraction の条件を外して baseColor を含む全テクスチャが
+            //   この経路を通るようになったため、衝突の条件を踏みやすくなった。
+            string glbName = Path.GetFileNameWithoutExtension(assetPath);
+            foreach (char c in Path.GetInvalidFileNameChars()) glbName = glbName.Replace(c, '_');
+            string folder = rootFolder + "/" + glbName;
+            if (!AssetDatabase.IsValidFolder(folder))
+            {
+                AssetDatabase.CreateFolder(rootFolder, glbName);
             }
 
             string safeName = string.IsNullOrEmpty(img.name) ? $"tex_{textureIndex}" : img.name;
