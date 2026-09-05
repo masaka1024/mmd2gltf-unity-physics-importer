@@ -467,10 +467,23 @@ namespace Mmd2GltfImporter
                 //   実測: 抽出済みの11枚だけが白くなり、未抽出のものは元からバイナリ経路に
                 //   落ちていたため無事だった (2026-08-25 の診断ログで確定)。
                 //   ★抽出していない場合 hasExtraction=false なので、従来と完全に同じ動作。
-                if (existing != null && hasExtraction
-                    && AssetDatabase.GetAssetPath(existing) == assetPath) existing = null;
-                if (existing != null) return existing;
-                return ExtractTextureFromGlb(texIndex, assetPath);
+                //   ★2026-09-06：hasExtraction の条件を外し、.glb 所有のサブアセットは常に
+                //   信用しないようにした。Extract 未実施でも問題が出るため。
+                //   ・Extract 済み → 実体が無い(ダングリング)。上記のとおり真っ白になる。
+                //   ・Extract 未実施 → 実体はあるが GlbScriptedImporter が作ったサブアセットで
+                //     TextureImporter を通らず、プラットフォーム圧縮が一切かからない。Unity 6 では
+                //     非圧縮 ARGB32 のまま残り、4096x4096 の1枚で約170MB(ミップ込み)を占める。
+                //     Quest 実機ではモデルを数体置くとテクスチャメモリを使い切って起動できない。
+                //   どちらの場合も GLB バイナリから取り直して通常アセットにするのが正しい。
+                bool ownedByGlb = existing != null && AssetDatabase.GetAssetPath(existing) == assetPath;
+                if (existing != null && !ownedByGlb) return existing;
+
+                var extracted = ExtractTextureFromGlb(texIndex, assetPath);
+                if (extracted != null) return extracted;
+
+                // 抽出できなかったときだけ従来の値へ戻す。ただし Extract 済みのサブアセットは
+                // ダングリングなので使えない。
+                return hasExtraction ? null : existing;
             }
 
             int converted = 0, skipped = 0, sphereApplied = 0, toonApplied = 0, outlineApplied = 0;
@@ -778,6 +791,36 @@ namespace Mmd2GltfImporter
             extractedTextureCache = new Dictionary<int, Texture2D>();
         }
 
+        // ★抽出テクスチャの上限サイズ。MMD由来の4Kテクスチャをそのまま持ち込むと
+        //   モバイルVRのテクスチャメモリを使い切るため、既定で2048に落とす。
+        private const int ExtractedTextureMaxSize = 2048;
+
+        // ★抽出したテクスチャは .glb のサブアセットと違って通常アセットなので TextureImporter が効く。
+        //   プロジェクト既定任せにせず、圧縮とサイズ上限を明示しておく。
+        private static void ApplyExtractedTextureImportSettings(string filePath)
+        {
+            var ti = AssetImporter.GetAtPath(filePath) as TextureImporter;
+            if (ti == null) return;
+
+            bool dirty = false;
+            if (ti.maxTextureSize > ExtractedTextureMaxSize)
+            {
+                ti.maxTextureSize = ExtractedTextureMaxSize;
+                dirty = true;
+            }
+            if (ti.textureCompression != TextureImporterCompression.Compressed)
+            {
+                ti.textureCompression = TextureImporterCompression.Compressed;
+                dirty = true;
+            }
+            if (!ti.mipmapEnabled)
+            {
+                ti.mipmapEnabled = true;
+                dirty = true;
+            }
+            if (dirty) ti.SaveAndReimport();
+        }
+
         // ★textures配列の番号(textureIndex)から、glTFのimages→bufferViewを辿って
         //   GLBバイナリ内の生画像バイト列を切り出し、Assetsフォルダ内へ新規テクスチャとして
         //   保存する。UniGLTFが標準スロット以外で使われる画像をインポートしないため、
@@ -822,6 +865,7 @@ namespace Mmd2GltfImporter
 
             File.WriteAllBytes(filePath, imgBytes);
             AssetDatabase.ImportAsset(filePath);
+            ApplyExtractedTextureImportSettings(filePath);
             var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(filePath);
 
             if (tex == null)
