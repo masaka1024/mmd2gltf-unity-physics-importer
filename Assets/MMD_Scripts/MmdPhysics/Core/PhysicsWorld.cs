@@ -151,10 +151,15 @@ namespace BulletPhysics
         public static bool ProfileEnabled = false;
         public static double ProfBroad, ProfBuild, ProfPrepare, ProfSpring, ProfWarm, ProfSolveContact, ProfSolveJoint, ProfIntegrate, ProfStore;
         public static long ProfSubSteps, ProfContacts, ProfManifolds;
+        // ブロードフェーズの内訳 (Issue #2): 候補ペア総数 / 境界球で棄却 / AABB で棄却 / ナローフェーズ到達。
+        // ProfManifolds は UseBroadphasePrefilter=true だと「点を持つか、持ち越し中のマニフォールド」だけを数える
+        // (従来は AABB を通過しただけの空マニフォールドも含んでいた)。
+        public static long ProfPairs, ProfPairsSphereRejected, ProfPairsAabbRejected, ProfDetectCalls;
         public static void ProfReset()
         {
             ProfBroad = ProfBuild = ProfPrepare = ProfSpring = ProfWarm = ProfSolveContact = ProfSolveJoint = ProfIntegrate = ProfStore = 0;
             ProfSubSteps = ProfContacts = ProfManifolds = 0;
+            ProfPairs = ProfPairsSphereRejected = ProfPairsAabbRejected = ProfDetectCalls = 0;
         }
         private static readonly System.Diagnostics.Stopwatch _psw = new();
         private static double Tick() { _psw.Stop(); double ms = _psw.Elapsed.TotalMilliseconds; _psw.Restart(); return ms; }
@@ -674,11 +679,46 @@ namespace BulletPhysics
             _pairCount = c; _pairBuiltForCount = n;
         }
 
+        // ═══ Issue #2 (2026-09-06): ブロードフェーズの早期棄却 — **結果ビット不変** ═══
+        //
+        //  Quest 3 実測 (モデル3体・剛体570) で `broad` が SubSteps=1 時の最大フェーズ (40%) であり、
+        //  AABB を通過したペア (≈1200/サブステップ) の約 94% が接触点を生まずに捨てられていた。
+        //  原因は ComputeAabb が「境界球 + Margin」の箱であること: 球は半径の **2倍**、カプセルは
+        //  hh + **2r** の箱になり、髪・スカートのように細長い剛体が密に並ぶ場所では緩すぎる。
+        //
+        //  対策1: AABB の前に境界球どうしの中心距離で棄却する。
+        //      |cB - cA| >= R_A + R_B + thr + slack  ⇒  ナローフェーズは必ず「接触なし」
+        //    根拠: 解析パス (球/カプセル/箱との組) はすべて「コア形状間の距離 < r_A + r_B + thr」で受理し、
+        //    コア間距離 >= 中心距離 - (extent_A + extent_B) なので、中心距離が BoundingRadius の和 + thr 以上
+        //    なら受理条件を満たせない。箱×箱 (GJK) は重なり (距離<0) のみ受理なので thr>=0 で包含される。
+        //    thr は Detect が使う受理閾値そのもの (GjkEpa.AcceptThresholdOf の両側 min)。
+        //    slack (1e-3) は両側の距離計算の丸め差を吸収する保守側の余裕 (棄却が緩くなる方向にしか効かない)。
+        //  対策2: 接触点ゼロで既存マニフォールドも無いペアは、辞書登録もマニフォールド生成もしない。
+        //    従来は AABB 通過だけで空のマニフォールドを作って Refresh していたが、点を持たないマニフォールドは
+        //    ソルバへ何も渡さない (BuildContactConstraints は Points を走査するだけ) ので挙動に影響しない。
+        //    既存マニフォールド (点を持ち越し中) は従来どおり Refresh → PruneStaleDeep を通す。
+        //  AABB 判定は **そのまま残す**。現行 AABB は箱で thr より狭くなり得る (Margin = minHalf*0.04 <
+        //  thr = 0.02*|he|) ため、AABB を外すと従来取りこぼしていたペアが新たに当たり結果が変わる。
+        //  従来の取りこぼしを忠実に維持するために両方通す (境界球判定 ⊂ AABB 判定 ではない)。
+        //
+        //  A/B 計測用に OFF にできる。OFF = 従来経路 (Detect を Refresh より先に呼ぶ順序だけ違うが、
+        //  Detect は剛体の姿勢だけから決まりマニフォールドを参照しないので順序は結果に影響しない)。
+        public bool UseBroadphasePrefilter = true;
+        /// <summary>境界球判定の保守側マージン (モデル単位)。受理閾値 (最小で 0.005 程度) より十分小さく、
+        /// float の丸め (≈1e-6) より十分大きい値。</summary>
+        public const float BroadphaseSphereSlack = 1e-3f;
+        private float[] _sphereRadiusScratch, _acceptThrScratch;
+
         private void BroadphaseNarrowphase()
         {
             int n = Bodies.Count;
             if (_pairCount < 0 || _pairBuiltForCount != n) BuildCollisionPairs();
-            if (_aabbScratch == null || _aabbScratch.Length < n) _aabbScratch = new Aabb[n];
+            if (_aabbScratch == null || _aabbScratch.Length < n)
+            {
+                _aabbScratch = new Aabb[n];
+                _sphereRadiusScratch = new float[n];
+                _acceptThrScratch = new float[n];
+            }
             var aabbs = _aabbScratch;
             // 検出帯を既定より広げているときだけ AABB も同じだけ膨らませる。
             // 広げないと「形状は帯の中なのに AABB 段階で捨てられる」ため帯の拡大が効かない。
@@ -687,23 +727,50 @@ namespace BulletPhysics
             if (extra > 0f) for (int i = 0; i < n; i++) { aabbs[i] = Bodies[i].ComputeAabb(); aabbs[i].Expand(extra); }
             else for (int i = 0; i < n; i++) aabbs[i] = Bodies[i].ComputeAabb();
 
+            bool prefilter = UseBroadphasePrefilter;
+            var sphR = _sphereRadiusScratch; var thr = _acceptThrScratch;
+            if (prefilter)
+            {
+                // 形状サイズは実行中に変わり得る前提で毎サブステップ取り直す (n 回の軽い計算。
+                // 受理閾値は static な A/B フラグ (BulletContactThreshold / SpeculativeMargin) にも依存する)。
+                for (int i = 0; i < n; i++)
+                {
+                    var s = Bodies[i].Shape;
+                    sphR[i] = s.BoundingRadius;
+                    thr[i] = GjkEpa.AcceptThresholdOf(s);
+                }
+            }
+            bool prof = ProfileEnabled;
+            if (prof) ProfPairs += _pairCount;
+
             var seen = _seenScratch; seen.Clear();
             for (int p = 0; p < _pairCount; p++)
             {
                 int i = _pairA[p], k = _pairB[p];
-                if (!aabbs[i].Intersects(ref aabbs[k])) continue;
                 var a = Bodies[i]; var b = Bodies[k];
+                if (prefilter)
+                {
+                    float lim = sphR[i] + sphR[k] + Math.Min(thr[i], thr[k]) + BroadphaseSphereSlack;
+                    var d = b.WorldTransform.Origin - a.WorldTransform.Origin;
+                    if (d.LengthSquared >= lim * lim) { if (prof) ProfPairsSphereRejected++; continue; }
+                }
+                if (!aabbs[i].Intersects(ref aabbs[k])) { if (prof) ProfPairsAabbRejected++; continue; }
 
                 long key = PairKey(a.Index, b.Index);
-                seen.Add(key);
-                if (!_manifolds.TryGetValue(key, out var m))
+                bool hasManifold = _manifolds.TryGetValue(key, out var m);
+                _detectBuffer.Clear();
+                GjkEpa.Detect(a, b, _detectBuffer);
+                if (prof) ProfDetectCalls++;
+                if (!hasManifold)
                 {
+                    // 対策2: 点が無ければ空マニフォールドを作らない (seen にも入れない = 従来の「作って
+                    // 次に AABB を外れたら掃除」と最終状態が同じ)。
+                    if (prefilter && _detectBuffer.Count == 0) continue;
                     m = new PersistentManifold(a, b);
                     _manifolds[key] = m;
                 }
+                seen.Add(key);
                 m.Refresh();
-                _detectBuffer.Clear();
-                GjkEpa.Detect(a, b, _detectBuffer);
                 for (int di = 0; di < _detectBuffer.Count; di++)
                     m.AddPoint(_detectBuffer[di]);
                 // ★タスク68: 今フレームのナローフェーズに確認されなかった深い点を落とす。

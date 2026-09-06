@@ -367,6 +367,12 @@ namespace BulletPhysics
             return h.Length * ContactThresholdFactor;   // disc(=|h|) * 0.02、center=0
         }
 
+        /// <summary>この形状が片側として持つ接触**受理**閾値。Detect はペアの両側の min を使う。
+        /// PhysicsWorld のブロードフェーズ早期棄却 (Issue #2) が「Detect が受理し得る最大距離」を
+        /// 見積もるのに使うので、Detect の閾値決定と**必ず同じ式**であること (ここ1箇所に集約)。</summary>
+        public static float AcceptThresholdOf(CollisionShape s) =>
+            BulletContactThreshold ? BulletBreakingThreshold(s) : SpeculativeMargin;
+
         // カプセル軸がほぼ平行とみなす閾値 (sin^2θ)。
         // cross(dA,dB)^2 = |dA|^2|dB|^2 sin^2θ なので、正規化した外積長^2 と比較する。
         // 1e-3 は sinθ≈0.0316 (≈1.8°)。スカート等の面接触が数度以内で平行判定されるよう
@@ -381,9 +387,8 @@ namespace BulletPhysics
         public static void Detect(RigidBody a, RigidBody b, List<ContactPoint> outPoints)
         {
             // ★このペアの受理閾値を先に決める (タスク38)。既定は従来どおり固定 0.02。
-            _pairThreshold = BulletContactThreshold
-                ? Math.Min(BulletBreakingThreshold(a.Shape), BulletBreakingThreshold(b.Shape))
-                : SpeculativeMargin;
+            //   (BulletContactThreshold=false なら両側とも SpeculativeMargin で min は恒等 = 従来と同値)
+            _pairThreshold = Math.Min(AcceptThresholdOf(a.Shape), AcceptThresholdOf(b.Shape));
 
             var ta = a.Shape.Type;
             var tb = b.Shape.Type;

@@ -173,6 +173,11 @@ namespace BulletPhysics.Unity
         [Tooltip("静止した剛体を非活性化して計算から外す(Bullet相当)。現状ほとんど発動しないため既定OFF")]
         public bool EnableSleeping = false;
 
+        // Issue #2: ブロードフェーズの早期棄却 (境界球の距離判定 + 空マニフォールドの生成省略)。
+        // シミュレーション結果はビット不変。A/B 計測 (PhysicsWorld.ProfileEnabled) のために OFF にできる。
+        [Tooltip("ブロードフェーズで境界球の距離判定によりナローフェーズ呼び出しを間引く。結果は変わらない (Issue #2)。A/B計測用にOFFにできる")]
+        public bool BroadphasePrefilter = true;
+
         [Header("Startup")]
         // 起動直後、アニメがフレーム0姿勢を確定させた後に物理をボーンへ再整合する遅延(フレーム数)。
         // バインド姿勢→フレーム0への瞬間移動でスカート等が脚へ貫入(突き抜け)するのを防ぐ。
@@ -381,6 +386,7 @@ namespace BulletPhysics.Unity
             _builder.World.UseSplitImpulse = ContactSplitImpulse;
             _builder.World.UseJointSplitImpulse = JointSplitImpulse;
             _builder.World.EnableSleeping = EnableSleeping;
+            _builder.World.UseBroadphasePrefilter = BroadphasePrefilter;
             ResolveBones();
             // 剛体を動かす前に検査する。この時点のスケルトンはバインド姿勢
             // (Animator がフレーム0を書くのは Start より後) なので PMX バインドと直接比較できる。
