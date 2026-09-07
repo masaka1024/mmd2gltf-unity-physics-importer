@@ -99,17 +99,30 @@ namespace BulletPhysics
         public static Matrix3x3 Diagonal(Vec3 d) =>
             new(new Vec3(d.x, 0, 0), new Vec3(0, d.y, 0), new Vec3(0, 0, d.z));
 
+        /// <summary>★2026-09-07: 64バイトの Matrix4x4 を組んでから 9 要素を抜き出していたのをやめ、
+        /// 必要な 9 成分だけを直接作る。式は Matrix4x4.Rotation のものをそのまま転記しており
+        /// (積・和・差の順序も同一)、値はビット単位で従来と同じ。</summary>
         public static Matrix3x3 FromQuat(Quat q)
         {
-            var m = Matrix4x4.Rotation(q);
-            // Matrix4x4 は転置格納 (Rᵀ) のため、ここで転置して行=Rの行 に揃える。
+            float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+            float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+            float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+            // Matrix4x4 は転置格納 (Rᵀ) なので、行=Rの行 に揃えた並びで書く。
             return new Matrix3x3(
-                new Vec3(m.m00, m.m10, m.m20),
-                new Vec3(m.m01, m.m11, m.m21),
-                new Vec3(m.m02, m.m12, m.m22));
+                new Vec3(1f - 2f * (yy + zz), 2f * (xy - wz),      2f * (xz + wy)),
+                new Vec3(2f * (xy + wz),      1f - 2f * (xx + zz), 2f * (yz - wx)),
+                new Vec3(2f * (xz - wy),      2f * (yz + wx),      1f - 2f * (xx + yy)));
         }
 
-        public Vec3 Column(int i) => new(Row0[i], Row1[i], Row2[i]);
+        /// <summary>★2026-09-07: Vec3 の添字プロパティ (範囲外 throw 付きの switch) を 3 回通していたのを
+        /// フィールド直参照に置き換え。並べ替えるだけで演算は無いのでビット不変。</summary>
+        public Vec3 Column(int i) => i switch
+        {
+            0 => new Vec3(Row0.x, Row1.x, Row2.x),
+            1 => new Vec3(Row0.y, Row1.y, Row2.y),
+            2 => new Vec3(Row0.z, Row1.z, Row2.z),
+            _ => throw new ArgumentOutOfRangeException(nameof(i))
+        };
 
         /// <summary>Bullet 2.75 btMatrix3x3::setRotation (btMatrix3x3.h:136) の移植。
         /// FromQuat と数学的には同じだが **式と丸めが違う**。
@@ -144,8 +157,6 @@ namespace BulletPhysics
         public Matrix3x3 Transposed() =>
             new(Column(0), Column(1), Column(2));
 
-        private Vec3 R(int i) => i == 0 ? Row0 : (i == 1 ? Row1 : Row2);
-
         /// <summary>Bullet 2.75 btMatrix3x3::inverse() の移植 (btMatrix3x3.h:536)。
         /// **余因子行列 ÷ 行列式** であって転置ではない。直交行列なら数学的には転置と同じだが、
         /// 浮動小数の値が違う: 転置は元の成分をそのまま並べ替えるので厳密な 0 が保たれるのに対し、
@@ -159,17 +170,29 @@ namespace BulletPhysics
         ///   髪が1ステップで自由落下 (g·dt² の全量 0.0272) した。</summary>
         public Matrix3x3 BulletInverse()
         {
-            var self = this;   // struct 内のローカル関数は this を触れないのでコピーする
-            float Cofac(int r1, int c1, int r2, int c2) =>
-                self.R(r1)[c1] * self.R(r2)[c2] - self.R(r1)[c2] * self.R(r2)[c1];
+            // ★2026-09-07: 従来は `self.R(r1)[c1]` で読んでいた。R(int) は Vec3 を **値で返す** ので
+            //   1 呼び出しごとに 12 バイトのコピーが起き、さらに Vec3 の添字 (範囲外 throw 付き switch)
+            //   を通る。Cofac 12 回 × 4 読みで 48 回ぶん。成分をローカルに展開すれば全部消える。
+            //
+            //   ★Cofac を **ローカル関数のまま残すこと**。ここが丸め点になっている。
+            //     a*b - c*d の中間値は評価スタック上では float32 より高い精度を持ちうるが (ECMA-335)、
+            //     戻り値の型が float なので **return で float32 へ丸められる**。
+            //     式に展開して `(a*b - c*d) * sc` と書くとこの丸めが消え、結果が 1 ULP ずれる。
+            //     実測: 剛体570・300ステップの全姿勢ダンプで 135,306 行が変化した (2026-09-07)。
+            float m00 = Row0.x, m01 = Row0.y, m02 = Row0.z;
+            float m10 = Row1.x, m11 = Row1.y, m12 = Row1.z;
+            float m20 = Row2.x, m21 = Row2.y, m22 = Row2.z;
+            float Cofac(float a, float b, float c, float d) => a * b - c * d;
 
-            var co = new Vec3(Cofac(1, 1, 2, 2), Cofac(1, 2, 2, 0), Cofac(1, 0, 2, 1));
+            var co = new Vec3(Cofac(m11, m22, m12, m21),    // 旧 Cofac(1,1,2,2)
+                              Cofac(m12, m20, m10, m22),    // 旧 Cofac(1,2,2,0)
+                              Cofac(m10, m21, m11, m20));   // 旧 Cofac(1,0,2,1)
             float det = Row0.Dot(co);
             float sc = 1f / det;
             return new Matrix3x3(
-                new Vec3(co.x * sc, Cofac(0, 2, 2, 1) * sc, Cofac(0, 1, 1, 2) * sc),
-                new Vec3(co.y * sc, Cofac(0, 0, 2, 2) * sc, Cofac(0, 2, 1, 0) * sc),
-                new Vec3(co.z * sc, Cofac(0, 1, 2, 0) * sc, Cofac(0, 0, 1, 1) * sc));
+                new Vec3(co.x * sc, Cofac(m02, m21, m01, m22) * sc, Cofac(m01, m12, m02, m11) * sc),
+                new Vec3(co.y * sc, Cofac(m00, m22, m02, m20) * sc, Cofac(m02, m10, m00, m12) * sc),
+                new Vec3(co.z * sc, Cofac(m01, m20, m00, m21) * sc, Cofac(m00, m11, m01, m10) * sc));
         }
 
         /// <summary>this * diag(scale) * this^T — basis に対角テンソルを回転適用。</summary>

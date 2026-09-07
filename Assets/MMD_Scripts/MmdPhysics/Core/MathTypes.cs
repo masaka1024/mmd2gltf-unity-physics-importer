@@ -4,6 +4,7 @@
 // ===========================================================================
 
 using System;
+using System.Runtime.CompilerServices;
 
 namespace BulletPhysics
 {
@@ -15,8 +16,11 @@ namespace BulletPhysics
     {
         public float x, y, z;
 
+        // ★[MethodImpl] は生成コードを変えない (呼び出しの展開だけ)。式も順序も同じでビット不変。
+        //   Prepare / Column / BulletInverse が 1 ステップに数十万回この添字を通る。
         public float this[int index]
         {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get
             {
                 return index switch
@@ -27,6 +31,7 @@ namespace BulletPhysics
                     _ => throw new ArgumentOutOfRangeException(nameof(index))
                 };
             }
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
             set
             {
                 switch (index)

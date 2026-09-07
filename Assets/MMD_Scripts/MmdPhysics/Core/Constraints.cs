@@ -1,4 +1,4 @@
-﻿// ===========================================================================
+// ===========================================================================
 // Unity Bullet 互換物理エンジン – Joint Constraints
 // PMX Joint 6 種を Bullet 相当の Sequential-Impulse で解く。
 //   0: ﾊﾞﾈ付6DOF -> btGeneric6DofSpringConstraint
@@ -330,6 +330,23 @@ namespace BulletPhysics
         }
         private RigidTransform _worldA, _worldB;
         private Vec3 _anchorA, _anchorB;
+
+        // ★腕長ゲート (LeverArmGate) が使う長さの、1 Prepare 内でのキャッシュ (2026-09-07)。
+        //   いずれも Prepare の中では不変なのに、並進 3 軸ぶん + モーター行ぶん繰り返し sqrt していた。
+        //   同じ入力から同じ値を作り直すだけなので、値も式もそのままでビット不変。
+        //   ★rA / rB の長さは Prepare の並進ループ専用。AddSpringMotorRow は角度行のとき
+        //     Vec3.Zero を渡してくるので、あちらでは従来どおり引数から都度求める。
+        private float _leverLenRA, _leverLenRB;
+        private bool _leverLenABReady;
+        private float _leverLenAnchorDelta;
+        private bool _leverLenAnchorReady;
+
+        /// <summary>|_anchorB - _anchorA|。Prepare 内で不変なので一度だけ求める。</summary>
+        private float LeverAnchorDelta()
+        {
+            if (!_leverLenAnchorReady) { _leverLenAnchorDelta = (_anchorB - _anchorA).Length; _leverLenAnchorReady = true; }
+            return _leverLenAnchorDelta;
+        }
         private Vec3[] _axesA = new Vec3[3];
         // ステップ2(b): Baumgarte バイアスを split-impulse(擬似速度)側へ分離するか。
         // false(既定)で従来どおり実速度側へバイアスを乗せる (挙動不変)。
@@ -452,6 +469,8 @@ namespace BulletPhysics
             _warmLinSeen[0] = _warmLinSeen[1] = _warmLinSeen[2] = false;
             _warmAngSeen[0] = _warmAngSeen[1] = _warmAngSeen[2] = false;
             _rowCount = 0;
+            _leverLenABReady = false;
+            _leverLenAnchorReady = false;
             if (BodyA == null || BodyB == null) return;
 
             _worldA = BodyA.WorldTransform * FrameInA;
@@ -474,11 +493,11 @@ namespace BulletPhysics
             var linDelta = _anchorB - _anchorA;
 
             // 回転相対 (角度行と、LinearLeverMode=2 の rotAllowed 判定で使用)。
-            var qRel = _worldA.Rotation.Conjugated() * _worldB.Rotation;
-            // BulletAngleConvention: Bullet 2.75 は実挙動として R_B⁻¹R_A のオイラーを見ている
-            // (btGetMatrixElem が列優先添字で、matrixToEulerXYZ が転置に対して働くため)。
-            // 既定 false のときは従来どおり qRel をそのまま使う = ビット不変。
-            var euler = ToEulerXYZ(BulletAngleConvention ? qRel.Conjugated().Normalized : qRel.Normalized);
+            // ★BulletLimitRowGating=true のときは下の分岐が euler を **上書きする** ので、
+            //   四元数側の euler は一度も読まれない。従来はここで無条件に計算していたが、
+            //   Quat の共役積 + Normalized (sqrt) + ToEulerXYZ (atan2×2 + asin) が丸ごと捨てられていた。
+            //   分岐の else へ移すだけなので、どちらの経路も式・順序は従来のままでビット不変。
+            Vec3 euler;
 
             // ★タスク62: LIMGATE のときは、限界判定に食わせる変位を **Bullet の実計算鎖**で作る。
             //   btGeneric6DofConstraint::calculateLinearInfo (btGeneric6DofConstraint.cpp:745)
@@ -513,6 +532,14 @@ namespace BulletPhysics
                 var invBasisA = basisAbt.BulletInverse();
                 linDiffBt = invBasisA * (oB - oA);
                 euler = ToEulerXYZBullet(invBasisA * basisBbt, BulletAngleConvention);
+            }
+            else
+            {
+                var qRel = _worldA.Rotation.Conjugated() * _worldB.Rotation;
+                // BulletAngleConvention: Bullet 2.75 は実挙動として R_B⁻¹R_A のオイラーを見ている
+                // (btGetMatrixElem が列優先添字で、matrixToEulerXYZ が転置に対して働くため)。
+                // 既定 false のときは従来どおり qRel をそのまま使う = ビット不変。
+                euler = ToEulerXYZ(BulletAngleConvention ? qRel.Conjugated().Normalized : qRel.Normalized);
             }
 
             // LinearLeverMode=2 用の前計算 (Bullet calculateTransforms / setLinearLimits 相当)。
@@ -590,8 +617,9 @@ namespace BulletPhysics
                     // ★タスク78: 腕長ゲート。誤差が自分の腕に対して大きすぎたら rA へ落とす。
                     if (LeverArmGate > 0f || LeverArmProbe)
                     {
-                        float scale = rA.Length + rB.Length;
-                        float ratio = scale > 1e-9f ? (_anchorB - _anchorA).Length / scale : 0f;
+                        if (!_leverLenABReady) { _leverLenRA = rA.Length; _leverLenRB = rB.Length; _leverLenABReady = true; }
+                        float scale = _leverLenRA + _leverLenRB;
+                        float ratio = scale > 1e-9f ? LeverAnchorDelta() / scale : 0f;
                         if (LeverArmProbe)
                         {
                             LeverArmRatioN++;
@@ -754,7 +782,7 @@ namespace BulletPhysics
                 if (LeverArmGate > 0f)
                 {
                     float gscale = rA.Length + rB.Length;
-                    if ((_anchorB - _anchorA).Length > LeverArmGate * gscale)
+                    if (LeverAnchorDelta() > LeverArmGate * gscale)
                     { armA = rA; LeverArmGateHits++; }
                 }
             }
