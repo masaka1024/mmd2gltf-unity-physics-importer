@@ -20,8 +20,12 @@ static class Program
 
     static int Main(string[] args)
     {
-        string glb = args.Length > 0 ? args[0]
-            : @"C:\Users\masa_\Downloads\mmd2gltf_full_20260726c\mmd2gltf_package3\csharp_test_out\IA_physics.glb";
+        if (args.Length < 1)
+        {
+            Console.Error.WriteLine("usage: BroadphaseHarness <model_physics.glb> [frames=1800]");
+            return 2;
+        }
+        string glb = args[0];
         int frames = args.Length > 1 ? int.Parse(args[1]) : 1800;
 
         var model = GlbPhysicsReader.LoadFile(glb, out float unitScale, out var warnings);
