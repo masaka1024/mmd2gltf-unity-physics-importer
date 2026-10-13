@@ -130,9 +130,13 @@ namespace BulletPhysics.Unity
         //   (Time.maximumDeltaTime でクランプ済み) を渡し、エンジンの固定刻みアキュムレータに任せる。
         //   いずれもソルバの dt は FixedTimeStep のまま。低 fps 時の脚のジャンプはエンジン側の
         //   キネマティック補間 (フレーム内サブステップへの等分配) が受け持つ。
-        // ★既定 OFF = 従来挙動 (FixedUpdate で Step、ビット不変)。ON は A/B で見た目を比べて決めること。
-        [Tooltip("ONで物理ステップを LateUpdate (アニメ確定後) に移す。物理が見る脚が1ステップ古くなる遅れが消える (Issue #8)。既定OFF=従来挙動")]
-        public bool StepInLateUpdate = false;
+        // ★既定 ON (2026-10-13)。Editor と Quest 3S 実機の A/B で採用:
+        //   スカート×脚の表示姿勢での最深貫入 (cm/フレーム) が、OFF 中央 0.34〜0.51 / 最大 2.1〜3.2 →
+        //   ON 中央 0.16〜0.17 / 最大 0.6〜1.2、1.6cm 超のフレームが窓あたり 16〜124 → 0。
+        //   ソルバ時点の貫入は両者同じ (= ソルバの仕事は不変)。詳細は Issue #8。
+        //   OFF = 従来挙動 (FixedUpdate で Step)。ソルバの演算順は OFF/ON とも同じ。
+        [Tooltip("ONで物理ステップを LateUpdate (アニメ確定後) に移す。物理が見る脚が1ステップ古くなる遅れが消える (Issue #8)。OFF=従来挙動 (FixedUpdate で Step)")]
+        public bool StepInLateUpdate = true;
         private int _fixedCallsThisFrame;      // StepInLateUpdate 用: このフレームの FixedUpdate 回数
         private Animator _animator;            // AlignAnimatorUpdateMode が解決した Animator (無ければ null)
         private Animation _legacyAnim;         // 同、レガシー Animation
@@ -761,7 +765,7 @@ namespace BulletPhysics.Unity
         // 瞬間移動で生じる脚への深い貫入(突き抜け)平衡を回避する。指定フレーム経過後はライブ物理へ。
         void LateUpdate()
         {
-            // ★Issue #8: StepInLateUpdate=ON ならアニメ確定後のここで 読む → 進める → 書き戻す。
+            // ★Issue #8: StepInLateUpdate=ON (既定) ならアニメ確定後のここで 読む → 進める → 書き戻す。
             //   TimingDiag の集計より前に置く (Fixed 側の姿勢は StepAfterAnimation が記録する)。
             if (StepInLateUpdate && _builder != null) StepAfterAnimation();
 
