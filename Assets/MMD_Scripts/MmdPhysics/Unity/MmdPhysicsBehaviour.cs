@@ -116,6 +116,31 @@ namespace BulletPhysics.Unity
         [Tooltip("ONで Time.maximumDeltaTime を下げ、重いフレームでの FixedUpdate 追いつき回数を制限する (物理コストの雪だるまを防ぐ)")]
         public bool LimitFixedUpdateCatchUp = true;
 
+        // ★2026-10-13 (Issue #8): 速い動きでスカートが脚を通り抜ける件の対策 (A/B 用トグル)。
+        // 症状: 同じモデル・同じモーションで、UE5 版より Unity 版の方がスカートの脚貫通が多い。
+        // 原因: 固定フェーズの順序が ScriptRunBehaviourFixedUpdate → LegacyFixedAnimationUpdate
+        //   (Animator なら DirectorFixedUpdate) なので、FixedUpdate で読む PushBonesToKinematic は
+        //   **1 固定ステップ前の脚** を見る。updateMode が Fixed でも Normal でも同じ。
+        //   実測 (TimingDiag・IA・右ひざ・Editor 20fps): 1 ステップあたり中央 0.3〜0.9cm、最大 4〜5cm。
+        //   速い区間ではスカートと脚のすき間 (約 1.6cm) を超える。
+        // 対策: 物理の「読む → 進める → 書き戻す」を LateUpdate (アニメ確定後) へまとめて移す。
+        //   UE5 版の Post-Process AnimBP と同じ順序になり、物理が見る脚 = 表示される脚になる。
+        //   刻みは変えない: ボーンが Fixed 更新なら、このフレームの FixedUpdate 回数 × 固定刻みだけ
+        //   進める (ボーンの進み方と 1:1、アキュムレータの端数も出ない)。Normal 更新なら Time.deltaTime
+        //   (Time.maximumDeltaTime でクランプ済み) を渡し、エンジンの固定刻みアキュムレータに任せる。
+        //   いずれもソルバの dt は FixedTimeStep のまま。低 fps 時の脚のジャンプはエンジン側の
+        //   キネマティック補間 (フレーム内サブステップへの等分配) が受け持つ。
+        // ★既定 ON (2026-10-13)。Editor と Quest 3S 実機の A/B で採用:
+        //   スカート×脚の表示姿勢での最深貫入 (cm/フレーム) が、OFF 中央 0.34〜0.51 / 最大 2.1〜3.2 →
+        //   ON 中央 0.16〜0.17 / 最大 0.6〜1.2、1.6cm 超のフレームが窓あたり 16〜124 → 0。
+        //   ソルバ時点の貫入は両者同じ (= ソルバの仕事は不変)。詳細は Issue #8。
+        //   OFF = 従来挙動 (FixedUpdate で Step)。ソルバの演算順は OFF/ON とも同じ。
+        [Tooltip("ONで物理ステップを LateUpdate (アニメ確定後) に移す。物理が見る脚が1ステップ古くなる遅れが消える (Issue #8)。OFF=従来挙動 (FixedUpdate で Step)")]
+        public bool StepInLateUpdate = true;
+        private int _fixedCallsThisFrame;      // StepInLateUpdate 用: このフレームの FixedUpdate 回数
+        private Animator _animator;            // AlignAnimatorUpdateMode が解決した Animator (無ければ null)
+        private Animation _legacyAnim;         // 同、レガシー Animation
+
         // ===================================================================
         // シーン単位で動的剛体の質量に上限を掛ける。**0 = 無効 (既定・ビット不変)。**
         //
@@ -424,13 +449,16 @@ namespace BulletPhysics.Unity
         /// 理由と実測は <see cref="AnimateInFixedUpdate"/> の注記を参照。</summary>
         public void AlignAnimatorUpdateMode()
         {
+            // StepInLateUpdate が「ボーンは Fixed 更新か」を判定するために、見つけたものを控える。
+            _animator = FindAnimator();
+            _legacyAnim = _animator == null ? FindLegacyAnimation() : null;
             if (!AnimateInFixedUpdate)
             {
                 Debug.Log("[MmdPhysics] AnimateInFixedUpdate が OFF のため Animator.updateMode は変更しません " +
                           "(描画fpsが落ちると揺れ物が暴れます)。");
                 return;
             }
-            var anim = FindAnimator();
+            var anim = _animator;
             if (anim == null)
             {
                 // ★2026-08-26: 実機は Animator ではなく **レガシーの Animation コンポーネント**だった。
@@ -441,7 +469,7 @@ namespace BulletPhysics.Unity
                 //     メタデータを読んで確認した:
                 //       AnimatorUpdateMode  = Normal, Fixed, UnscaledTime, AnimatePhysics
                 //       AnimationUpdateMode = Normal, Fixed
-                var legacy = FindLegacyAnimation();
+                var legacy = _legacyAnim;
                 if (legacy != null)
                 {
                     if (legacy.updateMode == AnimationUpdateMode.Fixed)
@@ -689,6 +717,14 @@ namespace BulletPhysics.Unity
         {
             if (_builder == null) return;
 
+            if (StepInLateUpdate)
+            {
+                // ★Issue #8: 読む/進める/書き戻すは LateUpdate 側 (StepAfterAnimation) で行う。
+                //   ここでは、このフレームの FixedUpdate 回数だけ数える (= Fixed 更新のボーンが進んだ回数)。
+                _fixedCallsThisFrame++;
+                return;
+            }
+
             // --- TimingDiag: FixedUpdate = 物理が見るボーン姿勢 (このフレームのPush前)。 ---
             if (_diagLeft > 0 && _diagTr != null && _diagFixedCount == 0) _diagFixedPos = _diagTr.position;
 
@@ -707,20 +743,7 @@ namespace BulletPhysics.Unity
 
             // 2. 飛んでいたら **ステップ前に** 置き直す。ここを Step の後にすると意味がない。
             //    併せて起動時と同じ「数フレームかけて整合させる」経路にも載せる (LateUpdate 側)。
-            if (teleported)
-            {
-                ResetPhysicsToBones();
-                _startupResetCountdown = PoseResetDelayFrames > 0 ? PoseResetDelayFrames : 1;
-                // ★発火したことを必ず残す。黙って動く対策は「効いていない」ことに気づけない
-                //   (2026-08-26 に updateMode の件で実際に踏んだ)。連発時はうるさいので上限つき。
-                if (_teleportLogged < 20)
-                {
-                    _teleportLogged++;
-                    Debug.Log($"[MmdPhysics] ボーンのテレポートを検出 (駆動ボーン {_teleportOver}/{_teleportTotal} 本が " +
-                              $"{TeleportResetThreshold} を超えて移動) → ステップ前に物理を再整合しました。" +
-                              (_teleportLogged == 20 ? " ※以後このログは省略します。" : ""));
-                }
-            }
+            if (teleported) ResetAfterTeleport();
 
 
             // 2. 物理ステップ。
@@ -742,6 +765,9 @@ namespace BulletPhysics.Unity
         // 瞬間移動で生じる脚への深い貫入(突き抜け)平衡を回避する。指定フレーム経過後はライブ物理へ。
         void LateUpdate()
         {
+            // ★Issue #8: StepInLateUpdate=ON (既定) ならアニメ確定後のここで 読む → 進める → 書き戻す。
+            //   TimingDiag の集計より前に置く (Fixed 側の姿勢は StepAfterAnimation が記録する)。
+            if (StepInLateUpdate && _builder != null) StepAfterAnimation();
 
             // --- TimingDiag: LateUpdate = Animator(Normal)適用後。表示に最も近い姿勢。 ---
             if (_diagLeft > 0 && _diagTr != null)
@@ -760,11 +786,12 @@ namespace BulletPhysics.Unity
                     float MedOf(List<float> v) => v.Count > 0 ? v[v.Count / 2] : 0f;
                     float MaxOf(List<float> v) => v.Count > 0 ? v[v.Count - 1] : 0f;
                     Debug.Log($"[TimingDiag] 要約: dFL(物理が見た姿勢と表示姿勢の差) 中央={MedOf(_diagDFL):F4} 最大={MaxOf(_diagDFL):F4} | dUL(Update vs Late=Animator書込タイミング) 中央={MedOf(_diagDUL):F4} 最大={MaxOf(_diagDUL):F4}"
-                        + " 判定: dFL,dULとも大 → AnimatorはUpdate後に書く=物理は1フレーム古い体を見ている(遅れ確定)。dFL≈0 → 遅れなし=別因。");
+                        + " 判定: dFL大 → 物理は1ステップ古い体を見ている(遅れ確定)。dUL大=ボーンは Update〜LateUpdate 間(Normal更新)、dUL≈0=固定フェーズ内(Fixed更新)で書かれている。dFL≈0 → 遅れなし=別因 (StepInLateUpdate=ON なら定義上 0)。");
                 }
             }
 
             if (_builder == null) return;
+            if (StepInLateUpdate) return;   // 再整合と書き戻しは StepAfterAnimation で済んでいる
 
             // ★テレポート検出は FixedUpdate へ移した (2026-08-26 / タスク93)。ここには置かない。
             //   理由: 判定式が KinematicTarget と比べるが、その値は **同じフレームの FixedUpdate で
@@ -785,6 +812,56 @@ namespace BulletPhysics.Unity
             //   LateUpdate なら Animator の後なので、揺れ物は必ず物理が勝つ。
             //   体のボーン(BoneFollow)には書き戻さないので、ダンスの動きはそのまま残る。
             PullPhysicsToBones();
+        }
+
+        /// <summary>Issue #8 (StepInLateUpdate=ON): アニメ確定後に「読む → 進める → 書き戻す」を一気に行う。
+        /// 順序は FixedUpdate 版と同じ: テレポート検出は Push の **前**、再整合は Step の **前**。</summary>
+        private void StepAfterAnimation()
+        {
+            // TimingDiag: 物理が読む姿勢 = 今の表示姿勢。dFL は定義上 0 になる (遅れが消えたことの確認用)。
+            if (_diagLeft > 0 && _diagTr != null) _diagFixedPos = _diagTr.position;
+            if (DumpBonePoseCsv) DumpBonePoseFrame();
+
+            bool teleported = DetectBoneTeleport();
+            PushBonesToKinematic();
+            if (teleported) ResetAfterTeleport();
+            // 起動直後の再整合。FixedUpdate 版は LateUpdate で Step の後に行うが、ここでは Step の前。
+            // どちらも「アニメが確定させた posed 骨格の周りへ置き直す」目的は同じ。
+            if (_startupResetCountdown > 0)
+            {
+                ResetPhysicsToBones();
+                _startupResetCountdown--;
+            }
+
+            // 進める量: ボーンが Fixed 更新なら FixedUpdate 回数 × 固定刻み (ボーンの進みと 1:1)。
+            // Normal 更新なら描画 dt (Time.maximumDeltaTime でクランプ済み) を固定刻みアキュムレータへ。
+            bool boneFixed = (_animator != null && _animator.updateMode == AnimatorUpdateMode.Fixed)
+                          || (_legacyAnim != null && _legacyAnim.updateMode == AnimationUpdateMode.Fixed);
+            int calls = _fixedCallsThisFrame;
+            _fixedCallsThisFrame = 0;
+            float dt = boneFixed ? calls * Time.fixedDeltaTime : Time.deltaTime;
+            if (dt > 0f)
+            {
+                _builder.World.StepSimulation(dt);
+                if (_diagLeft > 0) { _diagFixedCount = System.Math.Max(1, calls); _diagDt = dt; _diagSteps += _builder.World.LastStepsRun; }
+            }
+            PullPhysicsToBones();
+        }
+
+        /// <summary>テレポート検出時の再整合 + ログ。FixedUpdate 版と StepAfterAnimation の共通部。</summary>
+        private void ResetAfterTeleport()
+        {
+            ResetPhysicsToBones();
+            _startupResetCountdown = PoseResetDelayFrames > 0 ? PoseResetDelayFrames : 1;
+            // ★発火したことを必ず残す。黙って動く対策は「効いていない」ことに気づけない
+            //   (2026-08-26 に updateMode の件で実際に踏んだ)。連発時はうるさいので上限つき。
+            if (_teleportLogged < 20)
+            {
+                _teleportLogged++;
+                Debug.Log($"[MmdPhysics] ボーンのテレポートを検出 (駆動ボーン {_teleportOver}/{_teleportTotal} 本が " +
+                          $"{TeleportResetThreshold} を超えて移動) → ステップ前に物理を再整合しました。" +
+                          (_teleportLogged == 20 ? " ※以後このログは省略します。" : ""));
+            }
         }
 
         /// <summary>駆動ボーンが1フレームで大きく飛んだか (アニメのフレーム0→1・ループ境界・シーク)。
