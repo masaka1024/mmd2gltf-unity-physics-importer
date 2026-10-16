@@ -866,7 +866,7 @@ namespace Mmd2GltfImporter
             //   ★2026-09-06：hasExtraction の条件を外して baseColor を含む全テクスチャが
             //   この経路を通るようになったため、衝突の条件を踏みやすくなった。
             string glbName = Path.GetFileNameWithoutExtension(assetPath);
-            foreach (char c in Path.GetInvalidFileNameChars()) glbName = glbName.Replace(c, '_');
+            glbName = ToSafeFileName(glbName);
             string folder = rootFolder + "/" + glbName;
             if (!AssetDatabase.IsValidFolder(folder))
             {
@@ -874,7 +874,7 @@ namespace Mmd2GltfImporter
             }
 
             string safeName = string.IsNullOrEmpty(img.name) ? $"tex_{textureIndex}" : img.name;
-            foreach (char c in Path.GetInvalidFileNameChars()) safeName = safeName.Replace(c, '_');
+            safeName = ToSafeFileName(safeName);
             string filePath = $"{folder}/{safeName}{ext}";
 
             File.WriteAllBytes(filePath, imgBytes);
@@ -887,6 +887,25 @@ namespace Mmd2GltfImporter
 
             extractedTextureCache[textureIndex] = tex;
             return tex;
+        }
+
+        // ★ファイル名に使えない文字を '_' にする。Path.GetInvalidFileNameChars() は OS ごとに違い、
+        //   macOS/Linux では '/' と '\0' しか返さない。MMD 由来の名前は "tex\body.png" のような
+        //   Windows パスを含むことがあり、'\' が残ると Unity がそのファイルを無視してビルドが落ちる。
+        //   どの OS で抽出しても同じ名前になるよう、Windows で使えない文字はすべて置き換える。
+        private static readonly char[] WindowsInvalidFileNameChars = { '\\', '/', ':', '*', '?', '"', '<', '>', '|' };
+
+        private static string ToSafeFileName(string name)
+        {
+            var sb = new System.Text.StringBuilder(name.Length);
+            foreach (char c in name)
+            {
+                bool invalid = c < 32
+                    || Array.IndexOf(WindowsInvalidFileNameChars, c) >= 0
+                    || Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0;
+                sb.Append(invalid ? '_' : c);
+            }
+            return sb.ToString();
         }
 
         // ★MMD標準の共有トゥーン(toon01.bmp〜toon10.bmp)を、プロジェクト内から名前で探す。
@@ -931,7 +950,7 @@ namespace Mmd2GltfImporter
             }
 
             string safeName = string.IsNullOrEmpty(materialName) ? sourceMat.name : materialName;
-            foreach (char c in Path.GetInvalidFileNameChars()) safeName = safeName.Replace(c, '_');
+            safeName = ToSafeFileName(safeName);
             string path = $"{folder}/{safeName}.mat";
 
             Material existing = AssetDatabase.LoadAssetAtPath<Material>(path);
