@@ -15,6 +15,7 @@ using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 using BulletPhysics.Pmx;
+using BulletPhysics.Unity;
 
 namespace Mmd2GltfImporter
 {
@@ -89,18 +90,17 @@ namespace Mmd2GltfImporter
                 return false;
             }
 
-            // ボーン名 → Transform（エンジンと同じく名前で解決する）
-            var byName = new Dictionary<string, Transform>();
-            foreach (var t in modelRoot.GetComponentsInChildren<Transform>(true))
-                if (!byName.ContainsKey(t.name)) byName[t.name] = t;
+            // BoneIndex → Transform（エンジンと同じく skin 順優先・名前照合は予備。
+            // 名前照合は従来どおり非アクティブ込み・同名は先勝ち）
+            var bones = MmdImportAxis.ResolveBones(modelRoot.transform, model.BoneNames, true, false, out _);
 
             int unresolved = 0;
             foreach (var rb in model.RigidBodies)
             {
                 if (rb.PhysicsMode == 0) continue;                 // 0 = ボーン追従(体パーツ) は揺れ物ではない
                 if (rb.BoneIndex < 0 || rb.BoneIndex >= model.BoneNames.Count) continue; // 錘などボーン無し剛体
-                string boneName = model.BoneNames[rb.BoneIndex];
-                if (byName.TryGetValue(boneName, out var tr) && tr != null)
+                var tr = rb.BoneIndex < bones.Length ? bones[rb.BoneIndex] : null;
+                if (tr != null)
                     result[tr] = ClassifyPart(rb.Name);
                 else
                     unresolved++;

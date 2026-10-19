@@ -20,7 +20,7 @@
 //   剛体もボーンも GlbPhysicsReader が読む raw PMX 値。バインド時のボーンは回転恒等・
 //   位置のみなので、ボーンからのオフセットは PmxPhysicsBuilder.ComputeOffset と同じ式
 //   (boneWorld.InverseTimes(bodyWorld)) で求まる。Unityへは MmdPhysicsBehaviour と同じ
-//   「単位スケールのみ・Z反転なし」で写す。オイラー順序も engine の Quat.FromEuler に
+//   「単位スケール＋取り込み経路の軸規約 (MmdImportAxis。UniGLTF なら恒等)」で写す。オイラー順序も engine の Quat.FromEuler に
 //   合わせる（Unity の Quaternion.Euler とは順序が違うので使ってはいけない）。
 // ===========================================================================
 using System.Collections.Generic;
@@ -29,6 +29,7 @@ using UnityEditor;
 using UnityEngine;
 using BulletPhysics;
 using BulletPhysics.Pmx;
+using BulletPhysics.Unity;
 
 namespace Mmd2GltfImporter
 {
@@ -79,10 +80,13 @@ namespace Mmd2GltfImporter
             }
             if (unitScale <= 0f) unitScale = 0.08f;
 
-            // ボーン名 -> Transform。エンジンと同じく名前で解決する。
-            var byName = new Dictionary<string, Transform>();
-            foreach (var t in modelRoot.GetComponentsInChildren<Transform>(true))
-                if (!byName.ContainsKey(t.name)) byName[t.name] = t;
+            // BoneIndex -> Transform。エンジンと同じく skin 順優先・名前照合は予備
+            // (名前照合は従来どおり非アクティブ込み・同名は先勝ち)。
+            var bones = MmdImportAxis.ResolveBones(modelRoot.transform, model.BoneNames, true, false, out _);
+
+            // ★Issue #10: 取り込み経路の軸規約。エンジンと同じ共役変換をオフセットに掛ける
+            //   (掛けないと、UniGLTF 以外で取り込んだモデルではヒットボックスが体の反対側に出る)。
+            var axis = ResolveAxis(modelRoot, bones, model, unitScale);
 
             Remove(modelRoot, silent: true);   // 作り直しなので先に掃除（冪等）
 
@@ -101,7 +105,8 @@ namespace Mmd2GltfImporter
 
                 if (rb.BoneIndex < 0 || rb.BoneIndex >= model.BoneNames.Count) { unresolved++; continue; }
                 string boneName = model.BoneNames[rb.BoneIndex];
-                if (!byName.TryGetValue(boneName, out var bone) || bone == null)
+                var bone = rb.BoneIndex < bones.Length ? bones[rb.BoneIndex] : null;
+                if (bone == null)
                 {
                     Debug.LogWarning($"[MMD Hitbox] 剛体 '{rb.Name}' のボーン '{boneName}' が" +
                                      "モデル配下に見つかりません。この剛体は飛ばします。");
@@ -116,10 +121,11 @@ namespace Mmd2GltfImporter
                 var go = new GameObject($"hit_{i}_{rb.Name}");
                 go.transform.SetParent(bone, false);
                 // 親付け後にワールドで置くと、ボーンのローカルスケールに依らず正しい姿勢になる。
-                go.transform.position = bone.position +
-                    bone.rotation * new Vector3(offset.Origin.x, offset.Origin.y, offset.Origin.z) * unitScale;
-                go.transform.rotation = bone.rotation *
-                    new Quaternion(offset.Rotation.x, offset.Rotation.y, offset.Rotation.z, offset.Rotation.w);
+                // 共役変換は合成と可換 (S(A·B) = S(A)·S(B)) なので、オフセットにだけ掛ければよい。
+                go.transform.position = bone.position + bone.rotation * MmdImportAxis.ApplyPos(axis,
+                    new Vector3(offset.Origin.x, offset.Origin.y, offset.Origin.z)) * unitScale;
+                go.transform.rotation = bone.rotation * MmdImportAxis.ApplyRot(axis,
+                    new Quaternion(offset.Rotation.x, offset.Rotation.y, offset.Rotation.z, offset.Rotation.w));
                 if (layer != -1) go.layer = layer;
 
                 if (!AttachShape(go, rb, unitScale, asTrigger)) { Object.DestroyImmediate(go); unsupported++; continue; }
@@ -149,6 +155,27 @@ namespace Mmd2GltfImporter
             if (made > 0 && asTrigger)
                 Debug.Log("[MMD Hitbox] 判定の受け取り方: 相手側(弾・剣など)に Rigidbody + Collider を付け、" +
                           "OnTriggerEnter(Collider other) で other.GetComponent<MmdHitbox>().PartName を見てください。");
+        }
+
+        // 軸規約: モデルに配線済みの MmdPhysicsBehaviour が確定値を持っていればそれを使い、
+        // 無ければ (Auto / 未配線) その場でボーン配置から判定する。判定できなければ従来どおり恒等。
+        private static ImportAxisConvention ResolveAxis(GameObject modelRoot, Transform[] bones,
+                                                        PmxPhysicsModel model, float unitScale)
+        {
+            var beh = modelRoot.GetComponentInChildren<MmdPhysicsBehaviour>(true);
+            if (beh == null) beh = modelRoot.GetComponentInParent<MmdPhysicsBehaviour>(true);
+            if (beh != null && beh.ImportAxis != ImportAxisConvention.Auto) return beh.ImportAxis;
+
+            var d = MmdImportAxis.Detect(modelRoot.transform, bones, model.BonePositions, unitScale);
+            if (d.Reliable)
+            {
+                if (d.Best != ImportAxisConvention.Identity)
+                    Debug.Log($"[MMD Hitbox] 取り込み経路の軸規約を「{MmdImportAxis.Label(d.Best)}」と判定し、ヒットボックスの配置を合わせます。{d.Summary}");
+                return d.Best;
+            }
+            Debug.LogWarning($"[MMD Hitbox] 取り込み経路の軸規約を判定できないため「一致」として配置します ({d.Summary})。" +
+                             "モデルがバインド姿勢か確認してください。");
+            return ImportAxisConvention.Identity;
         }
 
         // PMXの形状をUnityコライダーへ。半寸法→全寸法などの換算は旧インポーターと同一。

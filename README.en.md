@@ -93,41 +93,55 @@ void OnTriggerEnter(Collider other) {
 ## Requirements
 
 - Unity with the Universal Render Pipeline (targeting Unity 6)
-- [UniGLTF](https://github.com/vrm-c/UniVRM) for glTF import
+- [UniGLTF](https://github.com/vrm-c/UniVRM) for glTF import (recommended; physics also works with Unity's standard glTF importer)
 - [lilToon](https://github.com/lilxyzw/lilToon) for material conversion (not needed if you only want physics)
 - A `.glb` produced by `mmd2gltf-gui`
 
-### You must import the `.glb` with UniGLTF
+### Importing the `.glb`: UniGLTF recommended (physics works with other importers too)
 
-Unity's standard glTF importer (**glTFast**, from the Package Manager) **does not work** here, and it
-fails **without any error or warning**. The symptom is hair and skirts swinging around to the front of
-the body.
+**UniGLTF** is recommended; material conversion (toon/sphere) has been tested with UniGLTF. Physics also
+works correctly when the `.glb` is imported with Unity's standard glTF importer (**glTFast**, from the
+Package Manager).
 
-The cause is the axis conversion done at import time. `mmd2gltf` **flips Z** when converting PMX to
-glTF, and UniGLTF **flips Z again** when importing glTF into Unity. The two cancel out, so Unity bone
-coordinates end up equal to native PMX coordinates — which is exactly what this physics engine assumes
-(its coordinate bridge is identity apart from unit scale). glTFast **flips X** instead, so nothing
-cancels and the skeleton ends up rotated 180° about Y relative to PMX. Rigid bodies are still built
-from the raw PMX coordinates stored in `extras.mmd`, so the two no longer agree.
+**Background** — importers apply different axis conversions. `mmd2gltf` **flips Z** when converting PMX
+to glTF, and UniGLTF **flips Z again** when importing into Unity, so the two cancel and Unity bone
+coordinates equal native PMX coordinates. glTFast **flips X** instead, so the skeleton ends up rotated
+180° about Y relative to PMX. Previously this could not be absorbed, and with glTFast hair and skirts
+swung around to the front of the body.
 
-**How to check** — select the `.glb` and read the Inspector header.
+Now, **Wire Physics** (step 1) detects the import path from the bone layout and stores it in
+`MmdPhysicsBehaviour`'s `Import Axis` (`Identity` = UniGLTF, `RotateY180` = glTFast, etc.). The coordinate
+bridge to the physics engine follows this value. Every supported convention keeps the Y axis (the
+direction of gravity), so **the physics results are the same as with UniGLTF**. Bones are matched by skin
+order rather than by name, so the numeric suffixes glTFast adds to duplicate bone names do not matter.
 
-| Header | Verdict |
+**Differences when importing with glTFast**
+
+- The whole model appears rotated 180° about Y (facing backwards). Physics stays consistent; rotate the
+  model root if needed.
+- Material conversion has not been tested with glTFast. If materials look wrong, use UniGLTF.
+- UniGLTF does not read sparse morph targets correctly (see "Known limitations"). glTFast does not have
+  this issue, but `morph_mode="dense"` is still recommended for export.
+
+**How to check which importer is in use** — select the `.glb` and read the Inspector header.
+
+| Header | Importer |
 |---|---|
-| `<name> Import Settings (Glb Scripted Importer)` | UniGLTF. Correct |
-| `<name> Import Settings (Gltf Importer)`, etc. | A different importer. Will not work |
+| `<name> Import Settings (Glb Scripted Importer)` | UniGLTF |
+| `<name> Import Settings (Gltf Importer)`, etc. | Another importer (glTFast, etc.) |
 
-**How to fix** — remove Unity's glTF importer from the Package Manager, install UniGLTF, reimport the
-`.glb` (if that does not take effect, delete the `.glb` and its `.meta` and add it again), then redo the
-physics wiring.
+If you reimport the `.glb` with a different importer, **redo the physics wiring** so the import path is
+detected and stored again.
 
-Also note that UniGLTF's axis setting is a **per-machine** preference
+UniGLTF's axis setting is a **per-machine** preference
 (`Edit > Preferences > UniGLTF > Default Invert axis`); it is not stored in the project. When a `.glb`
-has `Reverse Axis` set to `Default`, that machine-wide preference is what gets used. The default,
-**`Z`**, is the correct value. Check this when you start working on a different machine.
+has `Reverse Axis` set to `Default`, that machine-wide preference is used (the default is **`Z`**). The
+detection at wiring time absorbs a changed setting, but redoing the wiring is the safe choice when you
+start working on a different machine.
 
-> `MmdPhysicsBehaviour` checks for this mismatch on startup (`Check Import Convention`, on by default)
-> and logs an error with the cause and the fix.
+> `MmdPhysicsBehaviour` also checks the bone layout on startup (`Check Import Convention`, on by default)
+> and logs a warning if it disagrees with the stored `Import Axis`. If `Import Axis` is left at `Auto`,
+> the startup detection result is used as-is.
 
 ---
 

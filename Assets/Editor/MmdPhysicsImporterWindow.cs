@@ -251,7 +251,26 @@ namespace Mmd2GltfImporter
             var physicsData = CreatePhysicsDataAsset(glbPath);
             if (physicsData != null) behaviour.PhysicsData = physicsData;
             else Debug.LogWarning("[MMD Physics] 物理データ (.mmdphys.bytes) の書き出しに失敗しました。エディタでは動きますが、ビルド (APK 等) では揺れ物が動きません。");
-            behaviour.ModelRoot = root.transform; // ボーンTransformは名前でこの配下から解決される
+            behaviour.ModelRoot = root.transform; // ボーンTransformはこの配下から解決される (skin順優先・名前照合は予備)
+
+            // ★Issue #10: 取り込み経路の軸規約をここで判定して焼き込む。
+            //   配線は通常バインド姿勢のモデルに対して行うので、起動時 (アニメ適用前とはいえ、
+            //   ポーズ付きで保存されたプレハブでは誤判定しうる) より確実。起動時の判定は
+            //   「保存値と食い違ったら警告」する番人に回る。
+            string axisMsg;
+            if (behaviour.DetectAndStoreImportAxis(out string axisReport))
+            {
+                axisMsg = $"軸規約=「{MmdImportAxis.Label(behaviour.ImportAxis)}」" +
+                          (behaviour.ImportAxis == ImportAxisConvention.Identity ? "" : " (UniGLTF 以外の取り込みとして補正します)");
+                Debug.Log($"[MMD Physics] 取り込み経路を判定しました: {axisMsg}。{axisReport}");
+            }
+            else
+            {
+                axisMsg = $"軸規約=判定できず (保存値「{MmdImportAxis.Label(behaviour.ImportAxis)}」のまま)";
+                Debug.LogWarning($"[MMD Physics] 取り込み経路の軸規約を判定できませんでした ({axisReport})。" +
+                                 "モデルがバインド姿勢 (アニメ適用前) か確認して、もう一度配線してください。" +
+                                 "Auto のままなら起動時に判定します。");
+            }
 
             // ── 2) 排他切替コンポーネント ──
             var sw = root.GetComponent<MmdPhysicsBackendSwitch>();
@@ -263,6 +282,7 @@ namespace Mmd2GltfImporter
             EditorUtility.SetDirty(root);
             Debug.Log($"[MMD Physics] 自作Bulletエンジンを配線しました。GLB={glbPath}。"
                 + (physicsData != null ? $"物理データ={AssetDatabase.GetAssetPath(physicsData)} (ビルドへ同梱)。" : "")
+                + axisMsg + "。"
                 + "再生すると extras.mmd から物理を構築してボーンを駆動します（細かい設定は MmdPhysicsBehaviour の Inspector）。");
         }
 

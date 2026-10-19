@@ -92,37 +92,51 @@ void OnTriggerEnter(Collider other) {
 ## 必要なもの
 
 - Unity（Universal Render Pipeline を使用しているプロジェクト。想定は Unity 6）
-- [UniGLTF](https://github.com/vrm-c/UniVRM)（glTF のインポートに使用）
+- [UniGLTF](https://github.com/vrm-c/UniVRM)（glTF のインポートに推奨。Unity 標準の glTF インポーターでも物理は動きます）
 - [lilToon](https://github.com/lilxyzw/lilToon)（マテリアル変換に使用。物理演算のみを使う場合は不要）
 - `mmd2gltf-gui` で変換した `.glb` ファイル
 
-### ★ `.glb` は必ず UniGLTF で取り込んでください
+### `.glb` の取り込みは UniGLTF を推奨（他のインポーターでも物理は動きます）
 
-Unity 標準の glTF インポーター（Package Manager の **glTFast**）で取り込むと**動きません**。しかも
-**エラーも警告も一切出ません**。症状は「髪やスカートが体の正面へ回り込む」です。
+推奨は **UniGLTF** です。マテリアル変換（トゥーン/スフィア）の動作確認は UniGLTF で行っています。
+Unity 標準の glTF インポーター（Package Manager の **glTFast**）で取り込んだ場合も、物理は正しく動きます。
 
-理由は取り込み時の軸変換です。`mmd2gltf` は PMX→glTF で **Z を反転**し、UniGLTF は glTF→Unity で
-**再び Z を反転**します。この二重反転が相殺するので「Unity のボーン座標 = PMX ネイティブ座標」となり、
-物理エンジンはこれを前提に境界の座標変換を恒等（単位スケールのみ）にしています。
-glTFast は代わりに **X を反転**するため相殺が起きず、スケルトンだけが PMX に対して Y 軸 180° 回った
-状態になります。剛体は GLB の `extras.mmd` にある raw PMX 座標のまま構築されるため基準が食い違います。
+**背景** — 取り込み時の軸変換がインポーターによって違います。`mmd2gltf` は PMX→glTF で **Z を反転**し、
+UniGLTF は glTF→Unity で **再び Z を反転**するので相殺し、「Unity のボーン座標 = PMX ネイティブ座標」に
+なります。glTFast は代わりに **X を反転**するため、スケルトンは PMX に対して Y 軸 180° 回った状態になります。
+以前はこの違いを吸収できず、glTFast では髪やスカートが体の正面へ回り込んでいました。
 
-**確認方法** — `.glb` を選択して Inspector の見出しを見てください。
+現在は【1】**物理を配線** のときにボーンの配置から取り込み経路を判定し、`MmdPhysicsBehaviour` の
+`Import Axis` に保存します（`一致` = UniGLTF、`Y軸180°` = glTFast など）。物理エンジンとの境界の座標変換は
+この値に合わせて切り替わります。どの規約も Y 軸（重力の向き）を保つので、**物理の計算結果は UniGLTF の
+ときと変わりません**。ボーンの対応付けも名前ではなくスキンの並び順で行うので、glTFast が重複したボーン名に
+付ける連番の影響も受けません。
 
-| 見出し | 判定 |
+**glTFast で取り込んだときの違い**
+
+- モデル全体が Y 軸 180° 回って（後ろ向きに）見えます。物理は整合しているので、必要ならモデルのルートを
+  回してください。
+- マテリアル変換は glTFast では未検証です。見た目が崩れる場合は UniGLTF をお使いください。
+- UniGLTF には sparse 形式のモーフを正しく読めない不具合があります（「既知の制限」参照）。この点は
+  glTFast では起きませんが、エクスポートは引き続き `morph_mode="dense"` を推奨します。
+
+**使っているインポーターの確認方法** — `.glb` を選択して Inspector の見出しを見てください。
+
+| 見出し | インポーター |
 |---|---|
-| `<名前> Import Settings (Glb Scripted Importer)` | UniGLTF。正しい |
-| `<名前> Import Settings (Gltf Importer)` など | 別のインポーター。動きません |
+| `<名前> Import Settings (Glb Scripted Importer)` | UniGLTF |
+| `<名前> Import Settings (Gltf Importer)` など | 別のインポーター（glTFast など） |
 
-**直し方** — Package Manager から Unity の glTF インポーターを削除 → UniGLTF を導入 →
-`.glb` を Reimport（効かない場合は `.glb` と `.meta` を消して入れ直す）→ 物理の配線をやり直す。
+`.glb` を別のインポーターで取り込み直したときは、**物理の配線をやり直してください**（判定し直して保存します）。
 
-もう一点、UniGLTF の軸設定は **PC ごとの設定**（`Edit > Preferences > UniGLTF > Default Invert axis`）で、
+UniGLTF の軸設定は **PC ごとの設定**（`Edit > Preferences > UniGLTF > Default Invert axis`）で、
 プロジェクトには保存されません。`.glb` の Inspector の `Reverse Axis` が `Default` のときはこの PC 設定が
-使われます。既定の **`Z`** が正しい値です。別の PC で作業を始めたときはここも確認してください。
+使われます（既定は **`Z`**）。設定が変わっていても配線時の判定で吸収されますが、別の PC で作業を始めたときは
+物理の配線をやり直すと確実です。
 
-> この食い違いは `MmdPhysicsBehaviour` が起動時に自動検査します（`Check Import Convention`、既定 ON）。
-> 検出すると Console に原因と対処法つきの LogError を出します。
+> `MmdPhysicsBehaviour` は起動時にもボーン配置を検査します（`Check Import Convention`、既定 ON）。
+> 保存されている `Import Axis` と食い違っていれば Console に警告を出します。`Import Axis` が `Auto` の
+> ままなら、起動時の判定結果をそのまま使います。
 
 ---
 
