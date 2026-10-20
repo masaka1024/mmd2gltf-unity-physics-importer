@@ -302,17 +302,28 @@ namespace BulletPhysics.Unity
         }
 
         [Header("Import Check (取り込み経路の検証)")]
-        // ★このエンジンは「Unityのボーン座標 = PMXネイティブ座標」を前提に、境界の座標変換を
-        //   単位スケールのみの恒等写像にしている(下の MmdToUnityPos 参照)。これが成立するのは
-        //   GLB を **UniGLTF** で取り込んだ場合だけである:
-        //     mmd2gltf が PMX→glTF で Z を反転し、UniGLTF が glTF→Unity で再度 Z を反転して相殺する。
-        //   Unity 標準の glTF インポーター(glTFast)は代わりに X を反転するため相殺が起きず、
-        //   スケルトンは PMX に対して Y軸180°回った状態で取り込まれる。剛体は extras.mmd の
-        //   raw PMX 座標のまま構築されるので基準が食い違い、髪やスカートが体の反対側(正面)へ出る。
-        // ★この食い違いは Unity も UniGLTF も一切エラーを出さない (2026-08-12 に実際に踏んだ)。
-        //   だから起動時に自前で突き合わせる。検出できれば原因究明は数分で済む。
-        [Tooltip("起動時にボーン配置とPMXバインド位置を突き合わせ、取り込み時の軸変換の食い違いを検出してLogErrorする")]
+        // ★Unity のボーン座標と PMX ネイティブ座標の関係は、GLB を取り込んだインポーターで決まる:
+        //     UniGLTF  : mmd2gltf の Z 反転と UniGLTF の Z 反転が相殺 → 一致 (恒等)
+        //     glTFast  : Z でなく X を反転するので相殺しない → PMX に対して Y軸180° 回った状態
+        //   以前は境界を恒等に固定していたため UniGLTF 必須だった (glTFast だと髪やスカートが
+        //   体の正面へ回り込む。Unity もインポーターも一切エラーを出さない。2026-08-12 に実際に踏んだ)。
+        // ★Issue #10: 境界の変換を軸規約で切り替えられるようにした (詳細は MmdImportAxis.cs)。
+        //   どの規約も Y 軸を保つので、物理結果は PMX 空間内で不変のまま Unity 側だけが整合する。
+        //   規約はインポーターの【1】物理を配線 でボーン配置から判定して保存する。
+        //   起動時の判定は「保存値と食い違ったら警告」する番人。Auto のままなら起動時の判定結果を使う。
+        [Tooltip("GLB の取り込み経路の軸規約。Auto=起動時にボーン配置から自動判定 / 一致=UniGLTF / Y軸180°=Unity標準のglTFインポーター(glTFast)。" +
+                 "インポーターの【1】物理を配線 が判定して保存する")]
+        public ImportAxisConvention ImportAxis = ImportAxisConvention.Auto;
+
+        [Tooltip("起動時にボーン配置とPMXバインド位置を突き合わせ、ImportAxis と食い違えば警告する")]
         public bool CheckImportConvention = true;
+
+        // 実際に境界で使う規約 (Auto は起動時に確定する)。既定は従来どおりの恒等。
+        private ImportAxisConvention _axis = ImportAxisConvention.Identity;
+        private string _boneResolveMethod = "";
+
+        /// <summary>境界で実際に使っている軸規約 (起動前は Identity)。</summary>
+        public ImportAxisConvention EffectiveImportAxis => _axis;
 
         [Header("Debug")]
         // ★既定OFF (2026-08-10)。自作エンジンが既定の物理になり通常のシーンで常駐するため、
@@ -413,9 +424,10 @@ namespace BulletPhysics.Unity
             _builder.World.EnableSleeping = EnableSleeping;
             _builder.World.UseBroadphasePrefilter = BroadphasePrefilter;
             ResolveBones();
-            // 剛体を動かす前に検査する。この時点のスケルトンはバインド姿勢
-            // (Animator がフレーム0を書くのは Start より後) なので PMX バインドと直接比較できる。
-            if (CheckImportConvention) CheckImportConventionCore(false);
+            // 剛体を動かす前に軸規約を確定する (以降の境界変換はすべてこれを通る)。この時点の
+            // スケルトンはバインド姿勢 (Animator がフレーム0を書くのは Start より後) なので
+            // PMX バインドと直接比較できる。
+            ResolveImportAxisAtStartup();
             ResetPhysicsToBones();
             // アニメがフレーム0を適用するのは Start より後(Update→LateUpdate 間)。この時点の
             // リセットはバインド基準なので、LateUpdate で posed 姿勢へ再整合し直す予約を入れる。
@@ -589,14 +601,93 @@ namespace BulletPhysics.Unity
 
         private void ResolveBones()
         {
-            _boneTransforms = new Transform[_model.BoneNames.Count];
-            if (ModelRoot == null) return;
-            var map = new Dictionary<string, Transform>();
-            foreach (var t in ModelRoot.GetComponentsInChildren<Transform>())
-                map[t.name] = t;
-            for (int i = 0; i < _model.BoneNames.Count; i++)
-                if (map.TryGetValue(_model.BoneNames[i], out var tr))
-                    _boneTransforms[i] = tr;
+            // ★Issue #10: GLB のボーン順 (skins[0].joints 順) と同じ並びの SkinnedMeshRenderer.bones を
+            //   優先して使い、名前照合はフォールバックに回す (glTFast は重複ノード名にサフィックスを付けるため)。
+            //   フォールバックの名前照合は従来どおり (アクティブのみ・同名は後勝ち)。
+            _boneTransforms = ModelRoot == null
+                ? new Transform[_model.BoneNames.Count]
+                : MmdImportAxis.ResolveBones(ModelRoot, _model.BoneNames, false, true, out _boneResolveMethod);
+        }
+
+        // 起動時に境界の軸規約を確定する。
+        //   ImportAxis が確定値 → それを使う。CheckImportConvention なら判定して食い違えば警告 (番人)。
+        //   ImportAxis = Auto   → 判定結果が信用できればそれを使い、できなければ従来どおり恒等。
+        private void ResolveImportAxisAtStartup()
+        {
+            bool stored = ImportAxis != ImportAxisConvention.Auto;
+            if (stored && !CheckImportConvention)
+            {
+                _axis = ImportAxis;
+                return;
+            }
+
+            var d = DetectImportAxis();
+            string head = "[取り込み検査] " + d.Summary;
+            if (stored)
+            {
+                _axis = ImportAxis;
+                if (d.Reliable && d.Best != ImportAxis)
+                    Debug.LogWarning(head + "\n" +
+                        $"→ 保存されている軸規約は「{MmdImportAxis.Label(ImportAxis)}」ですが、ボーン配置は「{MmdImportAxis.Label(d.Best)}」に見えます。" +
+                        "保存値のまま続行します。.glb を別のインポーターで取り込み直した場合は、インポーターの【1】物理を配線 をやり直してください " +
+                        "(髪やスカートが体の反対側へ出るなら、この食い違いが原因です)。");
+                return;
+            }
+
+            if (d.Reliable)
+            {
+                _axis = d.Best;
+                if (d.Best != ImportAxisConvention.Identity)
+                    Debug.Log(head + "\n" +
+                        $"→ スケルトンは PMX に対して「{MmdImportAxis.Label(d.Best)}」の状態で取り込まれています。境界の変換をこれに合わせました " +
+                        "(物理結果は変わりません)。インポーターの【1】物理を配線 を実行すると、この判定が保存されて起動時の判定が不要になります。");
+                return;
+            }
+
+            _axis = ImportAxisConvention.Identity;
+            if (CheckImportConvention)
+            {
+                if (!d.Enough)
+                    Debug.LogError($"[取り込み検査] ボーンを {d.Resolved}/{d.Total} 本しか解決できません (未解決 {d.Unresolved})。" +
+                        "ModelRoot がモデルのルートを指しているか確認してください。軸規約は「一致」として続行します。");
+                else
+                    Debug.LogWarning(head + "\n" +
+                        "→ どの軸規約とも残差が大きく判定できないため「一致」として続行します。" +
+                        "ポーズ付きで保存されたプレハブ、UnitScale の不一致、GLB とモデルが別物、などが考えられます。" +
+                        "バインド姿勢でインポーターの【1】物理を配線 を実行するか、ImportAxis を手で設定してください。");
+            }
+        }
+
+        private MmdImportAxis.Detection DetectImportAxis() =>
+            MmdImportAxis.Detect(ModelRoot, _boneTransforms, _model.BonePositions, UnitScale);
+
+        /// <summary>エディタ (インポーターの【1】物理を配線) から呼ぶ: バインド姿勢のボーン配置から
+        /// 軸規約を判定し、信用できれば <see cref="ImportAxis"/> に保存する。
+        /// 判定できなければ ImportAxis は変えずに false を返す。report はログ用の説明。</summary>
+        public bool DetectAndStoreImportAxis(out string report)
+        {
+            report = "";
+            if (ModelRoot == null) { report = "ModelRoot が未設定のため判定できません。"; return false; }
+            // 入力の解決順は Start と同じ。GLB のスケルトンは extras.mmd の scale で取り込まれて
+            // いるので、判定もその値で行う。
+            float scale = 0f;
+            try
+            {
+                if (PhysicsData != null) _model = GlbPhysicsReader.LoadBytesAuto(PhysicsData.bytes, out scale, out _);
+                else if (Source == InputSource.Glb && !string.IsNullOrEmpty(GlbPath)) _model = GlbPhysicsReader.LoadFile(GlbPath, out scale, out _);
+                else if (Source == InputSource.Pmx && !string.IsNullOrEmpty(PmxPath)) _model = PmxReader.LoadFile(PmxPath);
+                else _model = null;
+            }
+            catch (System.Exception e) { report = $"モデル読込失敗: {e.Message}"; return false; }
+            if (_model == null) { report = "物理データを読めないため判定できません。"; return false; }
+            if (scale <= 0f) scale = UnitScale;
+
+            ResolveBones();
+            var d = MmdImportAxis.Detect(ModelRoot, _boneTransforms, _model.BonePositions, scale);
+            report = d.Summary + $" / ボーン解決: {_boneResolveMethod}";
+            if (!d.Reliable) return false;
+            ImportAxis = d.Best;
+            return true;
         }
 
         /// <summary>取り込み経路の検証。Inspector で右クリック → "Check import convention"。
@@ -612,105 +703,25 @@ namespace BulletPhysics.Unity
                 }
                 catch (System.Exception e) { Debug.LogWarning($"[取り込み検査] モデル読込失敗: {e.Message}"); }
             }
-            if (_model != null && ModelRoot != null) ResolveBones();
-            CheckImportConventionCore(true);
-        }
-
-        // ボーンの配置を PMX バインド位置と突き合わせ、恒等以外の軸変換が挟まっていれば
-        // 原因と対処法つきで LogError する。判定はモデルのシーン配置に影響されない:
-        // ModelRoot のローカルへ落として並進・回転・スケールを除去し、さらに重心を引いてから比較する。
-        private void CheckImportConventionCore(bool verbose)
-        {
-            if (ModelRoot == null || _model == null || _boneTransforms == null)
+            if (_model == null || ModelRoot == null)
             {
-                if (verbose) Debug.LogWarning("[取り込み検査] 実行不可 (ModelRoot / モデル / ボーンのいずれかが未設定)。");
+                Debug.LogWarning("[取り込み検査] 実行不可 (ModelRoot / モデルのいずれかが未設定)。");
                 return;
             }
-            int n = _model.BoneNames.Count;
-            if (_boneTransforms.Length < n) n = _boneTransforms.Length;
-            if (_model.BonePositions.Count < n) n = _model.BonePositions.Count;
-
-            var ux = new float[n]; var uy = new float[n]; var uz = new float[n];
-            var px = new float[n]; var py = new float[n]; var pz = new float[n];
-            int m = 0, unresolved = 0;
-            for (int i = 0; i < n; i++)
-            {
-                var tr = _boneTransforms[i];
-                if (tr == null) { unresolved++; continue; }
-                var l = ModelRoot.InverseTransformPoint(tr.position);
-                ux[m] = l.x / UnitScale; uy[m] = l.y / UnitScale; uz[m] = l.z / UnitScale;
-                var p = _model.BonePositions[i];
-                px[m] = p.x; py[m] = p.y; pz[m] = p.z;
-                m++;
-            }
-            if (m < 4)
-            {
-                Debug.LogError($"[取り込み検査] ボーンを {m}/{n} 本しか解決できません (未解決 {unresolved})。" +
-                    "ModelRoot がモデルのルートを指しているか、取り込み時にボーン名が変えられていないかを確認してください " +
-                    "(Unity 標準の glTF インポーターは重複するノード名にサフィックスを付けます)。");
-                return;
-            }
-
-            float cux = 0, cuy = 0, cuz = 0, cpx = 0, cpy = 0, cpz = 0;
-            for (int i = 0; i < m; i++) { cux += ux[i]; cuy += uy[i]; cuz += uz[i]; cpx += px[i]; cpy += py[i]; cpz += pz[i]; }
-            cux /= m; cuy /= m; cuz /= m; cpx /= m; cpy /= m; cpz /= m;
-
-            // 候補の軸変換それぞれで残差 RMS を測り、最も合うものを選ぶ。
-            //   一致    = mmd2gltf と UniGLTF の ReverseZ が相殺した期待どおりの状態
-            //   Y180    = 取り込み側が Z でなく X を反転した (Unity 標準の glTF インポーター等)
-            //   Z/X鏡映 = 掌性が反転している (境界に余分な符号反転が残っている)
-            string[] names = { "一致", "Y軸180度回転", "Z鏡映", "X鏡映" };
-            int[] sx = { 1, -1, 1, -1 };
-            int[] sz = { 1, -1, -1, 1 };
-            int best = 0; float bestRms = float.MaxValue, identityRms = 0f;
-            for (int c = 0; c < names.Length; c++)
-            {
-                double acc = 0;
-                for (int i = 0; i < m; i++)
-                {
-                    float dx = (ux[i] - cux) - sx[c] * (px[i] - cpx);
-                    float dy = (uy[i] - cuy) - (py[i] - cpy);
-                    float dz = (uz[i] - cuz) - sz[c] * (pz[i] - cpz);
-                    acc += dx * dx + dy * dy + dz * dz;
-                }
-                float rms = (float)System.Math.Sqrt(acc / m);
-                if (c == 0) identityRms = rms;
-                if (rms < bestRms) { bestRms = rms; best = c; }
-            }
-            // 許容量はモデルの広がりに対する相対値 (単位や体格に依存しないため)。
-            double sacc = 0;
-            for (int i = 0; i < m; i++)
-            { float dx = px[i] - cpx, dy = py[i] - cpy, dz = pz[i] - cpz; sacc += dx * dx + dy * dy + dz * dz; }
-            float spread = (float)System.Math.Sqrt(sacc / m);
-            float tol = 0.02f * (spread > 1e-3f ? spread : 1f);
-
-            string head = $"[取り込み検査] ボーン {m}/{n}" + (unresolved > 0 ? $" (未解決 {unresolved})" : "") +
-                $" 残差RMS: 一致={identityRms:F4} / 最良={names[best]}={bestRms:F4} / 許容={tol:F4} (PMX単位)";
-
-            if (best == 0)
-            {
-                if (identityRms <= tol)
-                {
-                    if (verbose) Debug.Log(head + " → OK。座標系は期待どおりです。");
-                }
-                else if (verbose)
-                {
-                    Debug.LogWarning(head + " → 軸変換は正しい(「一致」が最良)が残差が大きめです。" +
-                        "Play 中に実行するとアニメで姿勢が変わっているため大きく出ます。Play 前に実行してください。" +
-                        "Play 前でも大きい場合は UnitScale の不一致か、GLB とこのコンポーネントが参照するモデルが別物である可能性があります。");
-                }
-                return;
-            }
-
-            Debug.LogError(head + "\n" +
-                $"→ ★スケルトンが PMX に対して「{names[best]}」の状態で取り込まれています。" +
-                "剛体は GLB の extras.mmd にある raw PMX 座標のまま構築されるため基準が食い違い、" +
-                "髪やスカートが体の反対側(正面)へ出ます。\n" +
-                "原因はほぼ確実に GLB の取り込みに使ったインポーターです。.glb を選択して Inspector の見出しを見てください。\n" +
-                "  UniGLTF なら『<名前> Import Settings (Glb Scripted Importer)』と表示されます。" +
-                "『(Gltf Importer)』など他の名前なら、それが原因です。\n" +
-                "対処: Package Manager から Unity の glTF インポーターを削除 → UniGLTF (com.vrmc.gltf) を導入 → " +
-                ".glb を Reimport (効かない場合は .glb と .meta を消して入れ直す) → 物理の配線をやり直す。");
+            ResolveBones();
+            var d = DetectImportAxis();
+            string head = "[取り込み検査] " + d.Summary + $" / ボーン解決: {_boneResolveMethod}" +
+                          $" / 保存値: {MmdImportAxis.Label(ImportAxis)}";
+            if (!d.Enough)
+                Debug.LogError(head + "\n→ ボーンを十分に解決できません。ModelRoot がモデルのルートを指しているか確認してください。");
+            else if (!d.Reliable)
+                Debug.LogWarning(head + "\n→ どの軸規約とも残差が大きめです。Play 中に実行するとアニメで姿勢が変わっているため大きく出ます。" +
+                    "Play 前でも大きい場合は UnitScale の不一致か、GLB とこのコンポーネントが参照するモデルが別物である可能性があります。");
+            else if (ImportAxis != ImportAxisConvention.Auto && d.Best != ImportAxis)
+                Debug.LogWarning(head + $"\n→ ボーン配置は「{MmdImportAxis.Label(d.Best)}」ですが保存値と食い違っています。" +
+                    "インポーターの【1】物理を配線 をやり直すと更新されます。");
+            else
+                Debug.Log(head + $"\n→ OK。軸規約「{MmdImportAxis.Label(d.Best)}」で整合しています。");
         }
 
         void FixedUpdate()
@@ -1019,15 +1030,19 @@ namespace BulletPhysics.Unity
             return new RigidTransform(UnityToMmdRot(tr.rotation), UnityToMmdPos(tr.position));
         }
 
-        // --- 座標変換 (MMD ネイティブ <-> Unity, 単位スケールのみ。Z反転なし) ---
-        // メッシュ/スケルトンは mmd2gltf(ReverseZ) → UniGLTF(ReverseZ) の二重ReverseZが相殺し、
+        // --- 座標変換 (MMD ネイティブ <-> Unity) ---
+        // UniGLTF ではメッシュ/スケルトンは mmd2gltf(ReverseZ) → UniGLTF(ReverseZ) の二重ReverseZが相殺し、
         // Unityボーンは既にPMXネイティブ座標値になっている。物理剛体もGlbPhysicsReaderがraw PMXで構築。
-        // 従って境界は「単位スケールのみ」の真の等長変換にする(以前の3回目Z反転=鏡映バグを除去)。
+        // 従ってその場合の境界は「単位スケールのみ」の真の等長変換(以前の3回目Z反転=鏡映バグを除去)。
         // 実測(DumpZ)でX-Z掌性の符号反転=鏡映を確認済み(PMX+1.583 vs U2M-1.583)。
-        public Vector3 MmdToUnityPos(Vec3 v) => new(v.x * UnitScale, v.y * UnitScale, v.z * UnitScale);
-        public Vec3 UnityToMmdPos(Vector3 v) => new(v.x / UnitScale, v.y / UnitScale, v.z / UnitScale);
-        public static Quaternion MmdToUnityRot(Quat q) => new(q.x, q.y, q.z, q.w);
-        public static Quat UnityToMmdRot(Quaternion q) => new(q.x, q.y, q.z, q.w);
+        // ★Issue #10: 他のインポーター向けに、軸規約 _axis による共役変換を重ねる (恒等なら従来と同一)。
+        //   ボーンの読み書き・ギズモはすべてこの 4 関数を通る。変換はいずれも自己逆。
+        public Vector3 MmdToUnityPos(Vec3 v) =>
+            MmdImportAxis.ApplyPos(_axis, new Vector3(v.x * UnitScale, v.y * UnitScale, v.z * UnitScale));
+        public Vec3 UnityToMmdPos(Vector3 v) =>
+            MmdImportAxis.ApplyPos(_axis, new Vec3(v.x / UnitScale, v.y / UnitScale, v.z / UnitScale));
+        public Quaternion MmdToUnityRot(Quat q) => MmdImportAxis.ApplyRot(_axis, new Quaternion(q.x, q.y, q.z, q.w));
+        public Quat UnityToMmdRot(Quaternion q) => MmdImportAxis.ApplyRot(_axis, new Quat(q.x, q.y, q.z, q.w));
 
         // Z符号確定用の診断: Play中に Inspector で本コンポーネントを右クリック→"Dump Z history"。
         // UnityToMmdPos(ボーン世界位置) を PMXバインド位置と成分比較する。
