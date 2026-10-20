@@ -113,12 +113,12 @@ namespace Mmd2GltfImporter
             }
 
             // ★半透明の「2段階」対策。筒状の半透明(袖など)は TwoPass だと奥の面が重なって濃くなる。
-            //   自動判定は難しいため、気づいたマテリアルを選んで手動で「表面だけ」にし、固定する。
+            //   自動判定は難しいため、気づいたマテリアルを選んで手動で「重なり1段階」にし、固定する。
             //   対象は Project で選択中の .mat (targetPrefab 不要)。
             EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button(L("選択中の半透明マテリアルを「表面だけ」にして固定", "Set Selected Transparent Materials to Front-Only & Lock")))
+            if (GUILayout.Button(L("選択中の半透明マテリアルを「重なり1段階」にして固定", "Set Selected Transparent Materials to Single-Layer & Lock")))
             {
-                LockSelectedAsFrontOnly();
+                LockSelectedAsSingleLayer();
             }
             if (GUILayout.Button(L("固定を解除", "Unlock"), GUILayout.Width(80)))
             {
@@ -126,10 +126,12 @@ namespace Mmd2GltfImporter
             }
             EditorGUILayout.EndHorizontal();
             EditorGUILayout.HelpBox(
-                L("袖など筒状の半透明が2段階の濃さに見えるときに使います。Project で .mat を選んで押すと、裏面を描かない透過に変え、" +
+                L("袖など筒状の半透明が2段階の濃さに見えるときに使います。Project で .mat を選んで押すと、手前の面の深度を先に書く描き方に変え" +
+                  "（外側からは1枚分の濃さ、内側からは内面が見える）、" +
                   $"ラベル '{KeepRenderLabel}' を付けます。ラベル付きのマテリアルは「2.」を再実行しても描き方（透過方式・両面・描画順）を維持します。",
                   "Use when a tube-shaped transparent part (e.g. sleeves) shows two opacity levels. Select .mat assets in the Project and press: " +
-                  $"switches to back-face-culled transparency and adds the label '{KeepRenderLabel}'. Labeled materials keep their render state when \"2.\" is re-run."),
+                  "switches to a depth pre-pass of the front faces (one layer from outside, inner surface still visible from inside) " +
+                  $"and adds the label '{KeepRenderLabel}'. Labeled materials keep their render state when \"2.\" is re-run."),
                 MessageType.None);
 
             EditorGUILayout.Space();
@@ -1027,8 +1029,12 @@ namespace Mmd2GltfImporter
         //
         //  ・筒状の半透明(袖など)は TwoPass(裏面→表面) だと、手前の布越しに同じパーツの
         //    奥の面が重なって2枚分の濃さになる (モデルZ の袖で確認、2026-10-20)。
-        //  ・「表面だけ」(Normal透過 + 裏面カット) なら1枚分になるが、どのマテリアルが
-        //    筒状かはデータから判別しにくいので、自動判定せず手動で選んで固定する。
+        //  ・TwoPass の1パス目 (FORWARD_BACK, _Pre*) を「表面の深度だけ書く」パスにすると、
+        //    外側からは奥の面が深度で弾かれて1枚分になり、内側からは (見える面が全部裏面なので
+        //    1パス目は何も書かず) 内面がそのまま描かれる。
+        //    ★「表面だけ」(Normal透過 + 裏面カット) は外側は1枚分になるが、内側から見ると
+        //    輪郭線パス (Cull Front・不透明) の内面が覆われず袖口が真っ黒になるので採らない。
+        //  ・どのマテリアルが筒状かはデータから判別しにくいので、自動判定せず手動で選んで固定する。
         //  ・固定は Unity のアセットラベルで持つ。ラベル付きのマテリアルは
         //    SaveAsStandaloneMaterial が描き方を退避→復元するので、「2.」を再実行しても戻らない。
         // ═══════════════════════════════════════════
@@ -1053,6 +1059,7 @@ namespace Mmd2GltfImporter
         {
             dst.shader = keep.shader;
             if (keep.HasProperty("_TransparentMode")) dst.SetFloat("_TransparentMode", keep.GetFloat("_TransparentMode"));
+            if (keep.HasProperty("_PreCutoff") && dst.HasProperty("_PreCutoff")) dst.SetFloat("_PreCutoff", keep.GetFloat("_PreCutoff"));
             foreach (var prefix in RenderStatePrefixes)
             {
                 foreach (var suffix in RenderStateSuffixes)
@@ -1070,7 +1077,7 @@ namespace Mmd2GltfImporter
             dst.renderQueue = keep.renderQueue;
         }
 
-        private void LockSelectedAsFrontOnly()
+        private void LockSelectedAsSingleLayer()
         {
             var mats = Selection.GetFiltered<Material>(SelectionMode.Assets);
             if (mats.Length == 0)
@@ -1088,18 +1095,23 @@ namespace Mmd2GltfImporter
                     continue;
                 }
 
-                Undo.RecordObject(m, "Lock Front-Only Transparency");
+                Undo.RecordObject(m, "Lock Single-Layer Transparency");
                 int queue = m.renderQueue; // MMDの材質順を保った描画順はそのまま使う
                 bool hasOutline = m.shader.name.Contains("Outline");
-                SetupLilToonRenderingMode(m, 2, 0, hasOutline); // Transparent / Normal(1パス)
-                m.SetFloat("_Cull", 2f);                         // 2=Back：裏面(奥の面)を描かない
+                SetupLilToonRenderingMode(m, 2, 2, hasOutline); // Transparent / TwoPass
+                // 1パス目 (FORWARD_BACK) を表面の深度だけ書くパスにする
+                m.SetFloat("_PreColorMask", 0f);  // 色は書かない
+                m.SetFloat("_PreCull", 2f);       // 2=Back：表面だけ
+                m.SetFloat("_PreZWrite", 1f);
+                m.SetFloat("_PreCutoff", 0.05f);  // ほぼ透明な所は深度を書かない (既定0.5だと薄い透け部分が抜ける)
+                m.SetFloat("_Cull", 0f);          // 2パス目は両面：内側から見たときの内面を描く
                 m.renderQueue = queue;
 
                 var labels = new List<string>(AssetDatabase.GetLabels(m));
                 if (!labels.Contains(KeepRenderLabel)) labels.Add(KeepRenderLabel);
                 AssetDatabase.SetLabels(m, labels.ToArray());
                 EditorUtility.SetDirty(m);
-                Debug.Log($"[MMD Material] '{m.name}' を「表面だけ」にして固定しました（shader={m.shader.name}, queue={m.renderQueue}）。");
+                Debug.Log($"[MMD Material] '{m.name}' を「重なり1段階」にして固定しました（shader={m.shader.name}, queue={m.renderQueue}）。");
             }
             AssetDatabase.SaveAssets();
         }
