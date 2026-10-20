@@ -195,6 +195,7 @@ truth as well** (https://github.com/masaka1024/mmd2gltf-cs-physics).
 3. Assign the scene model to the target field
 4. **[1] Wire / Re-wire Physics** — this alone makes physics work
 5. **[2] Convert Materials to lilToon** — independent of physics, run any time
+   - If a tube-shaped transparent part (e.g. sleeves) shows two opacity levels, select its `.mat` in the Project and press **"Set Selected Transparent Materials to Front-Only & Lock"**. It gets the label `MmdKeepRender`, and re-running [2] keeps its render state (transparency mode, culling, queue). "Unlock" returns it to the importer's choice.
 6. **[3] Build Hitboxes** — only if you need them
 
 Fine-tuning of physics (timestep, penetration handling) lives on the `MmdPhysicsBehaviour` component added by step 1.

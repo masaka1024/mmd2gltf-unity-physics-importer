@@ -112,6 +112,26 @@ namespace Mmd2GltfImporter
                 EditorGUI.indentLevel--;
             }
 
+            // ★半透明の「2段階」対策。筒状の半透明(袖など)は TwoPass だと奥の面が重なって濃くなる。
+            //   自動判定は難しいため、気づいたマテリアルを選んで手動で「表面だけ」にし、固定する。
+            //   対象は Project で選択中の .mat (targetPrefab 不要)。
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button(L("選択中の半透明マテリアルを「表面だけ」にして固定", "Set Selected Transparent Materials to Front-Only & Lock")))
+            {
+                LockSelectedAsFrontOnly();
+            }
+            if (GUILayout.Button(L("固定を解除", "Unlock"), GUILayout.Width(80)))
+            {
+                UnlockSelectedRenderState();
+            }
+            EditorGUILayout.EndHorizontal();
+            EditorGUILayout.HelpBox(
+                L("袖など筒状の半透明が2段階の濃さに見えるときに使います。Project で .mat を選んで押すと、裏面を描かない透過に変え、" +
+                  $"ラベル '{KeepRenderLabel}' を付けます。ラベル付きのマテリアルは「2.」を再実行しても描き方（透過方式・両面・描画順）を維持します。",
+                  "Use when a tube-shaped transparent part (e.g. sleeves) shows two opacity levels. Select .mat assets in the Project and press: " +
+                  $"switches to back-face-culled transparency and adds the label '{KeepRenderLabel}'. Labeled materials keep their render state when \"2.\" is re-run."),
+                MessageType.None);
+
             EditorGUILayout.Space();
 
             // ═══════════════════════════════════════════
@@ -956,9 +976,20 @@ namespace Mmd2GltfImporter
             Material existing = AssetDatabase.LoadAssetAtPath<Material>(path);
             if (existing != null)
             {
+                // ★手動で描き方を固定したマテリアル(ラベル付き)は、上書き前の描き方を退避して戻す。
+                //   テクスチャ・色・トゥーン等は今回の変換結果で更新される。
+                Material keep = HasKeepRenderLabel(existing) ? new Material(existing) : null;
+
                 // 既存の.matを使い回す：中身を今回の変換結果で丸ごと上書き
                 existing.shader = sourceMat.shader;
                 existing.CopyPropertiesFromMaterial(sourceMat);
+
+                if (keep != null)
+                {
+                    RestoreRenderState(existing, keep);
+                    DestroyImmediate(keep);
+                    Debug.Log($"[MMD Material] '{safeName}' は '{KeepRenderLabel}' で固定中のため、描き方を維持しました（shader={existing.shader.name}, queue={existing.renderQueue}）。");
+                }
                 EditorUtility.SetDirty(existing);
                 return existing;
             }
@@ -969,6 +1000,101 @@ namespace Mmd2GltfImporter
                 AssetDatabase.CreateAsset(copy, path);
                 return copy;
             }
+        }
+
+        // ═══════════════════════════════════════════
+        //  描き方の手動固定（半透明の「2段階」対策）
+        //
+        //  ・筒状の半透明(袖など)は TwoPass(裏面→表面) だと、手前の布越しに同じパーツの
+        //    奥の面が重なって2枚分の濃さになる (モデルZ の袖で確認、2026-10-20)。
+        //  ・「表面だけ」(Normal透過 + 裏面カット) なら1枚分になるが、どのマテリアルが
+        //    筒状かはデータから判別しにくいので、自動判定せず手動で選んで固定する。
+        //  ・固定は Unity のアセットラベルで持つ。ラベル付きのマテリアルは
+        //    SaveAsStandaloneMaterial が描き方を退避→復元するので、「2.」を再実行しても戻らない。
+        // ═══════════════════════════════════════════
+        private const string KeepRenderLabel = "MmdKeepRender";
+
+        // ★描き方を決める lilToon のプロパティ。本体・輪郭線(_Outline*)・前処理パス(_Pre*)に同名で並ぶ。
+        //   _MatCapBlend 等の「見た目の合成」は含めない (変換結果で更新してよい側)。
+        private static readonly string[] RenderStateSuffixes =
+        {
+            "Cull", "ZWrite", "ZTest", "ColorMask", "AlphaToMask", "OffsetFactor", "OffsetUnits",
+            "SrcBlend", "DstBlend", "SrcBlendAlpha", "DstBlendAlpha", "BlendOp", "BlendOpAlpha",
+            "SrcBlendFA", "DstBlendFA", "SrcBlendAlphaFA", "DstBlendAlphaFA", "BlendOpFA", "BlendOpAlphaFA",
+            "StencilRef", "StencilReadMask", "StencilWriteMask", "StencilComp", "StencilPass", "StencilFail", "StencilZFail",
+        };
+        private static readonly string[] RenderStatePrefixes = { "_", "_Outline", "_Pre" };
+
+        private static bool HasKeepRenderLabel(Material m)
+            => Array.IndexOf(AssetDatabase.GetLabels(m), KeepRenderLabel) >= 0;
+
+        // keep の描き方 (シェーダー・描画順・キーワード・パス有効/無効・ブレンド等) を dst へ戻す
+        private static void RestoreRenderState(Material dst, Material keep)
+        {
+            dst.shader = keep.shader;
+            if (keep.HasProperty("_TransparentMode")) dst.SetFloat("_TransparentMode", keep.GetFloat("_TransparentMode"));
+            foreach (var prefix in RenderStatePrefixes)
+            {
+                foreach (var suffix in RenderStateSuffixes)
+                {
+                    string prop = prefix + suffix;
+                    if (keep.HasProperty(prop) && dst.HasProperty(prop)) dst.SetFloat(prop, keep.GetFloat(prop));
+                }
+            }
+            dst.shaderKeywords = keep.shaderKeywords;
+            for (int i = 0; i < keep.passCount; i++)
+            {
+                string pass = keep.GetPassName(i);
+                if (!string.IsNullOrEmpty(pass)) dst.SetShaderPassEnabled(pass, keep.GetShaderPassEnabled(pass));
+            }
+            dst.renderQueue = keep.renderQueue;
+        }
+
+        private void LockSelectedAsFrontOnly()
+        {
+            var mats = Selection.GetFiltered<Material>(SelectionMode.Assets);
+            if (mats.Length == 0)
+            {
+                Debug.LogWarning("[MMD Material] Project で .mat を選択してから押してください。");
+                return;
+            }
+
+            foreach (var m in mats)
+            {
+                // lilToon の透過系以外は対象外 (不透明を透過へ変えてしまわないように)
+                if (!m.shader.name.Contains("lilToon") || !m.shader.name.Contains("Transparent"))
+                {
+                    Debug.LogWarning($"[MMD Material] '{m.name}' は lilToon の半透明ではないためスキップしました（shader={m.shader.name}）。");
+                    continue;
+                }
+
+                Undo.RecordObject(m, "Lock Front-Only Transparency");
+                int queue = m.renderQueue; // MMDの材質順を保った描画順はそのまま使う
+                bool hasOutline = m.shader.name.Contains("Outline");
+                SetupLilToonRenderingMode(m, 2, 0, hasOutline); // Transparent / Normal(1パス)
+                m.SetFloat("_Cull", 2f);                         // 2=Back：裏面(奥の面)を描かない
+                m.renderQueue = queue;
+
+                var labels = new List<string>(AssetDatabase.GetLabels(m));
+                if (!labels.Contains(KeepRenderLabel)) labels.Add(KeepRenderLabel);
+                AssetDatabase.SetLabels(m, labels.ToArray());
+                EditorUtility.SetDirty(m);
+                Debug.Log($"[MMD Material] '{m.name}' を「表面だけ」にして固定しました（shader={m.shader.name}, queue={m.renderQueue}）。");
+            }
+            AssetDatabase.SaveAssets();
+        }
+
+        private void UnlockSelectedRenderState()
+        {
+            var mats = Selection.GetFiltered<Material>(SelectionMode.Assets);
+            foreach (var m in mats)
+            {
+                var labels = new List<string>(AssetDatabase.GetLabels(m));
+                if (!labels.Remove(KeepRenderLabel)) continue;
+                AssetDatabase.SetLabels(m, labels.ToArray());
+                Debug.Log($"[MMD Material] '{m.name}' の固定を解除しました。次回の「2.」でインポーターの判定に戻ります。");
+            }
+            AssetDatabase.SaveAssets();
         }
 
         // ★targetPrefab配下の全Rendererを走査し、oldMatを参照しているスロットをnewMatへ差し替える
